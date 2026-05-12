@@ -1,0 +1,21 @@
+{
+  "install_env": {
+    "INSTALL_MODE": "standard",
+    "CLUSTER_DOMAIN": "",
+    "BASE_DOMAIN": "",
+    "BASTION_IP": "",
+    "BOOTSTRAP_IP": "",
+    "MASTER01_IP": "",
+    "MASTER02_IP": "",
+    "MASTER03_IP": "",
+    "INFRA01_IP": "",
+    "INFRA02_IP": "",
+    "INFRA03_IP": "",
+    "WORKER01_IP": "",
+    "WORKER02_IP": "",
+    "WORKER03_IP": "",
+    "REGISTRY_PASSWORD": "P@ssw0rd",
+    "SSH_KEY": "",
+    "ADDITIONAL_TRUST_BUNDLE": ""
+  }
+}

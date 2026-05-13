@@ -30,6 +30,8 @@ if 'tools_downloaded' not in st.session_state:
     st.session_state.tools_downloaded = False
 if 'cluster_configured' not in st.session_state:
     st.session_state.cluster_configured = False
+if 'operators_saved' not in st.session_state:
+    st.session_state.operators_saved = False
 
 def log_info(msg):
     st.info(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -46,20 +48,14 @@ def main():
         st.title("🛠️ OpenShift Prep")
         st.markdown("---")
         
-        # 步驟式導航
-        step1_disabled = False # 第一步總是可用或已完成
-        step2_disabled = not st.session_state.tools_downloaded
-        step3_disabled = not st.session_state.cluster_configured
-        step4_disabled = not os.path.exists(os.path.join(CURRENT_DIR, 'operators.json'))
+        st.button("1. 🔧 Tool Config & Setup", use_container_width=True, key="nav_step1", disabled=False)
+        st.button("2. 🏗️ Cluster Config", use_container_width=True, key="nav_step2", disabled=not st.session_state.tools_downloaded)
+        st.button("3. 📦 Operators & CSI", use_container_width=True, key="nav_step3", disabled=not st.session_state.cluster_configured)
+        st.button("4. ✅ Final Review", use_container_width=True, key="nav_step4", disabled=not os.path.exists(os.path.join(CURRENT_DIR, 'operators.json')))
 
-        if st.button("1. 🔧 Tool Config & Setup", use_container_width=True, disabled=step1_disabled):
-            st.session_state.current_view = 'tool_config'
-        if st.button("2. 🏗️ Cluster Config", use_container_width=True, disabled=step2_disabled):
-            st.session_state.current_view = 'cluster_config'
-        if st.button("3. 📦 Operators & CSI", use_container_width=True, disabled=step3_disabled):
-            st.session_state.current_view = 'operators'
-        if st.button("4. ✅ Final Review", use_container_width=True, disabled=step4_disabled):
-            st.session_state.current_view = 'review'
+        st.markdown("---")
+        # 顯示當前進度
+        st.write(f"**Current Step:** {st.session_state.current_view.replace('_', ' ').title()}")
 
     # 視圖路由
     if st.session_state.current_view == 'tool_config':
@@ -123,9 +119,14 @@ def show_tool_config_page():
                     if wizard.run_untar_oc_mirror(config):
                         log_success("✅ untar_oc_mirror 完成")
                         st.success("✅ tool_config 配置完成！")
-                        st.info("請前往側邊欄進行下一步：Cluster Config")
                     else:
                         log_error("❌ untar_oc_mirror 失敗")
+    # 下一步按鈕
+    if st.session_state.tools_downloaded:
+        st.divider()
+        if st.button("➡️ Next: Cluster Config", use_container_width=True):
+            st.session_state.current_view = 'cluster_config'
+            st.rerun()
 
 def show_cluster_config_page():
     st.title("2. 🏗️ Cluster Configuration")
@@ -134,30 +135,104 @@ def show_cluster_config_page():
     config_manager = ConfigManager('cluster_config.json')
     config = config_manager.get_config()
 
+    if 'master_count' not in st.session_state:
+        st.session_state.master_count = sum(1 for k in config['install_env'] if k.startswith('MASTER'))
+    if 'infra_count' not in st.session_state:
+        st.session_state.infra_count = sum(1 for k in config['install_env'] if k.startswith('INFRA'))
+    if 'worker_count' not in st.session_state:
+        st.session_state.worker_count = sum(1 for k in config['install_env'] if k.startswith('WORKER'))
+
     with st.form("cluster_config_form"):
         st.subheader("Cluster Identity")
         col1, col2 = st.columns(2)
         with col1:
             config['install_env']['INSTALL_MODE'] = st.selectbox("Install Mode", ["standard", "compact", "sno"], index=["standard", "compact", "sno"].index(config['install_env']['INSTALL_MODE']))
-            config['install_env']['CLUSTER_DOMAIN'] = st.text_input("Cluster Name (metadata.name)", value=config['install_env']['CLUSTER_DOMAIN'], help="例如: ocp4")
+            config['install_env']['CLUSTER_DOMAIN'] = st.text_input("Cluster Name (metadata.name)", value=config['install_env']['CLUSTER_DOMAIN'], help="例如：ocp4")
         with col2:
-            config['install_env']['BASE_DOMAIN'] = st.text_input("Base Domain", value=config['install_env']['BASE_DOMAIN'], help="例如: demo.lab")
+            config['install_env']['BASE_DOMAIN'] = st.text_input("Base Domain", value=config['install_env']['BASE_DOMAIN'], help="例如：demo.lab")
 
         st.divider()
         st.subheader("Network & Nodes")
-        st.markdown("#### IP Addresses")
-        cols = st.columns(3)
-        with cols[0]:
+
+       # Master Node 配置
+        st.markdown("#### Master Nodes")
+        master_cols = st.columns([3, 1])
+        with master_cols[0]:
+            st.write(f"Current Master Count: {st.session_state.master_count}")
+        with master_cols[1]:
+            new_master_count = st.number_input(
+                "Master Count",
+                min_value=1,
+                max_value=3,
+                value=st.session_state.master_count,
+                key="master_count_input"
+            )
+            if new_master_count != st.session_state.master_count:
+                st.session_state.master_count = new_master_count
+                st.rerun()
+
+        # 動態生成 Master IP 輸入框
+        for i in range(1, st.session_state.master_count + 1):
+            ip_key = f"MASTER{i:02d}_IP"
+            if ip_key not in config['install_env']:
+                config['install_env'][ip_key] = ""
+            config['install_env'][ip_key] = st.text_input(f"Master {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"master_{i}_ip")
+
+        # Infra Node 配置
+        st.markdown("#### Infra Nodes")
+        infra_cols = st.columns([3, 1])
+        with infra_cols[0]:
+            st.write(f"Current Infra Count: {st.session_state.infra_count}")
+        with infra_cols[1]:
+            new_infra_count = st.number_input(
+                "Infra Count",
+                min_value=0,
+                max_value=3,
+                value=st.session_state.infra_count,
+                key="infra_count_input"
+            )
+            if new_infra_count != st.session_state.infra_count:
+                st.session_state.infra_count = new_infra_count
+                st.rerun()
+
+        # 動態生成 Infra IP 輸入框
+        for i in range(1, st.session_state.infra_count + 1):
+            ip_key = f"INFRA{i:02d}_IP"
+            if ip_key not in config['install_env']:
+                config['install_env'][ip_key] = ""
+            config['install_env'][ip_key] = st.text_input(f"Infra {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"infra_{i}_ip")
+
+        # Worker Node 配置
+        st.markdown("#### Worker Nodes")
+        worker_cols = st.columns([3, 1])
+        with worker_cols[0]:
+            st.write(f"Current Worker Count: {st.session_state.worker_count}")
+        with worker_cols[1]:
+            new_worker_count = st.number_input(
+                "Worker Count",
+                min_value=0,
+                max_value=9,
+                value=st.session_state.worker_count,
+                key="worker_count_input"
+            )
+            if new_worker_count != st.session_state.worker_count:
+                st.session_state.worker_count = new_worker_count
+                st.rerun()
+
+        # 動態生成 Worker IP 輸入框
+        for i in range(1, st.session_state.worker_count + 1):
+            ip_key = f"WORKER{i:02d}_IP"
+            if ip_key not in config['install_env']:
+                config['install_env'][ip_key] = ""
+            config['install_env'][ip_key] = st.text_input(f"Worker {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"worker_{i}_ip")
+
+        # Bastion 和 Bootstrap IP
+        st.markdown("#### Other IPs")
+        col_bast, col_boot = st.columns(2)
+        with col_bast:
             config['install_env']['BASTION_IP'] = st.text_input("Bastion IP", value=config['install_env']['BASTION_IP'])
+        with col_boot:
             config['install_env']['BOOTSTRAP_IP'] = st.text_input("Bootstrap IP", value=config['install_env']['BOOTSTRAP_IP'])
-        with cols[1]:
-            config['install_env']['MASTER01_IP'] = st.text_input("Master 01 IP", value=config['install_env']['MASTER01_IP'])
-            config['install_env']['MASTER02_IP'] = st.text_input("Master 02 IP", value=config['install_env']['MASTER02_IP'])
-            config['install_env']['MASTER03_IP'] = st.text_input("Master 03 IP", value=config['install_env']['MASTER03_IP'])
-        with cols[2]:
-            # 僅在 standard 模式顯示 Infra/Worker，此處簡化全部顯示
-            config['install_env']['INFRA01_IP'] = st.text_input("Infra 01 IP", value=config['install_env']['INFRA01_IP'])
-            config['install_env']['WORKER01_IP'] = st.text_input("Worker 01 IP", value=config['install_env']['WORKER01_IP'])
             
         st.divider()
         st.subheader("Credentials & Keys")
@@ -218,6 +293,13 @@ def show_cluster_config_page():
                         
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
+
+    # 下一步按鈕
+    if st.session_state.cluster_configured:
+        st.divider()
+        if st.button("➡️ Next: Operators & CSI", use_container_width=True):
+            st.session_state.current_view = 'operators'
+            st.rerun()
 
 def show_operators_page():
     st.title("3. 📦 Operator Selection & CSI Configuration")
@@ -335,6 +417,7 @@ def show_operators_page():
                         with open(output_path, 'w') as f:
                             f.write(yaml_content)
                         
+                        st.session_state.operators_saved = True
                         st.success(f"✅ `operators.json` & `imageset-config.yaml` generated!<br>Path: `{output_path}`", unsafe_allow_html=True)
                         
                         with st.expander("Preview imageset-config.yaml"):
@@ -342,6 +425,13 @@ def show_operators_page():
                             
                     except Exception as e:
                         st.error(f"Error generating imageset: {str(e)}")
+
+    # 下一步按鈕
+    if os.path.exists(os.path.join(CURRENT_DIR, 'operators.json')):
+        st.divider()
+        if st.button("➡️ Next: Final Review", use_container_width=True):
+            st.session_state.current_view = 'review'
+            st.rerun()
 
 def show_review_page():
     st.title("4. ✅ Final Review")
@@ -376,6 +466,10 @@ def show_review_page():
             st.json(json.load(f))
     else:
         st.warning("File not found.")
+
+    # 完成提示
+    st.divider()
+    st.success("🎉 所有步驟已完成！配置文件已準備就緒。")
 
 if __name__ == "__main__":
     main()

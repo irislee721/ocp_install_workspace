@@ -315,3 +315,175 @@ class YAMLGenerator:
         }
 
         return yaml.dump(config_map, sort_keys=False, allow_unicode=True)
+    
+    def generate_agent_config(self):
+        """生成 AgentConfig YAML"""
+        # 驗證 IP 格式
+        invalid_ips = self.validate_ips()
+        if invalid_ips:
+            raise ValueError(f"Invalid IPv4 addresses found:\n" + "\n".join(invalid_ips))
+
+        cluster_name = self.env.get('CLUSTER_DOMAIN', 'ocp4')
+        if '.' in cluster_name:
+            cluster_name = cluster_name.split('.')[0]
+        if not cluster_name:
+            cluster_name = "ocp4"
+
+        # rendezvousIP 等於 MASTER01_IP
+        rendezvous_ip = self.env.get('MASTER01_IP', '')
+        if not rendezvous_ip:
+            raise ValueError("MASTER01_IP is required for AgentConfig")
+
+        bastion_ip = self.env.get('BASTION_IP', '')
+        gateway_ip = self.env.get('GATEWAY_IP', '')
+
+        # 構建 hosts 列表
+        hosts = []
+
+        # Master nodes
+        for i in range(1, 4):
+            ip_key = f"MASTER{i:02d}_IP"
+            mac_key = f"MASTER{i:02d}_MAC"
+            iface_key = f"MASTER{i:02d}_INTERFACE"
+            device_key = f"MASTER{i:02d}_DEVICE"
+
+            ip = self.env.get(ip_key, '')
+            if ip:
+                mac = self.env.get(mac_key, 'BC:24:11:99:B8:1B')
+                interface = self.env.get(iface_key, 'ens18')
+                device = self.env.get(device_key, '/dev/sda')
+
+                host = self._build_host_entry(
+                    hostname=f"master-{i}",
+                    role="master",
+                    ip=ip,
+                    mac=mac,
+                    interface=interface,
+                    device=device,
+                    bastion_ip=bastion_ip,
+                    gateway_ip=gateway_ip
+                )
+                hosts.append(host)
+
+        # Infra nodes
+        for i in range(1, 4):
+            ip_key = f"INFRA{i:02d}_IP"
+            mac_key = f"INFRA{i:02d}_MAC"
+            iface_key = f"INFRA{i:02d}_INTERFACE"
+            device_key = f"INFRA{i:02d}_DEVICE"
+
+            ip = self.env.get(ip_key, '')
+            if ip:
+                mac = self.env.get(mac_key, 'BC:24:11:99:B8:1B')
+                interface = self.env.get(iface_key, 'ens18')
+                device = self.env.get(device_key, '/dev/sda')
+
+                host = self._build_host_entry(
+                    hostname=f"infra-{i}",
+                    role="worker",
+                    ip=ip,
+                    mac=mac,
+                    interface=interface,
+                    device=device,
+                    bastion_ip=bastion_ip,
+                    gateway_ip=gateway_ip
+                )
+                hosts.append(host)
+
+        # Worker nodes
+        for i in range(1, 10):
+            ip_key = f"WORKER{i:02d}_IP"
+            mac_key = f"WORKER{i:02d}_MAC"
+            iface_key = f"WORKER{i:02d}_INTERFACE"
+            device_key = f"WORKER{i:02d}_DEVICE"
+
+            ip = self.env.get(ip_key, '')
+            if ip:
+                mac = self.env.get(mac_key, 'BC:24:11:99:B8:1B')
+                interface = self.env.get(iface_key, 'ens18')
+                device = self.env.get(device_key, '/dev/sda')
+
+                host = self._build_host_entry(
+                    hostname=f"worker-{i}",
+                    role="worker",
+                    ip=ip,
+                    mac=mac,
+                    interface=interface,
+                    device=device,
+                    bastion_ip=bastion_ip,
+                    gateway_ip=gateway_ip
+                )
+                hosts.append(host)
+
+        config_map = {
+            "apiVersion": "v1alpha1",
+            "kind": "AgentConfig",
+            "metadata": {
+                "name": cluster_name
+            },
+            "rendezvousIP": rendezvous_ip,
+            "additionalNTPSources": [bastion_ip] if bastion_ip else [],
+            "hosts": hosts
+        }
+
+        return self._dump_yaml(config_map)
+
+    def _build_host_entry(self, hostname, role, ip, mac, interface, device, bastion_ip, gateway_ip):
+        """構建單個 host 條目"""
+        # 計算 prefix-length (從 MACHINE_NETWORK_CIDR 或預設 24)
+        machine_cidr = self.env.get('MACHINE_NETWORK_CIDR', '')
+        prefix_length = 24
+        if machine_cidr and '/' in machine_cidr:
+            try:
+                prefix_length = int(machine_cidr.split('/')[1])
+            except:
+                pass
+
+        return {
+            "hostname": hostname,
+            "role": role,
+            "interfaces": [
+                {
+                    "name": interface,
+                    "macAddress": mac.upper()
+                }
+            ],
+            "networkConfig": {
+                "interfaces": [
+                    {
+                        "name": interface,
+                        "type": "ethernet",
+                        "state": "up",
+                        "mac-address": mac.upper(),
+                        "ipv4": {
+                            "enabled": True,
+                            "address": [
+                                {
+                                    "ip": ip,
+                                    "prefix-length": prefix_length
+                                }
+                            ],
+                            "dhcp": False
+                        }
+                    }
+                ],
+                "dns-resolver": {
+                    "config": {
+                        "server": [bastion_ip] if bastion_ip else []
+                    }
+                },
+                "routes": {
+                    "config": [
+                        {
+                            "destination": "0.0.0.0/0",
+                            "next-hop-address": gateway_ip if gateway_ip else "",
+                            "next-hop-interface": interface,
+                            "table-id": 254
+                        }
+                    ]
+                }
+            },
+            "rootDeviceHints": {
+                "deviceName": device
+            }
+        }

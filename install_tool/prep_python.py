@@ -1,6 +1,7 @@
 from logging import config
 from re import match
 import re
+import shutil
 
 import streamlit as st
 import json
@@ -8,6 +9,7 @@ import os
 import sys
 import re
 from datetime import datetime
+import time
 
 # 導入自定義模組
 from config_manager import ConfigManager
@@ -79,7 +81,74 @@ def show_tool_config_page():
     config_manager = ConfigManager('tool_config.json')
     config = config_manager.get_config()
     wizard = SetupWizard(CURRENT_DIR)
-    
+
+    with st.expander("🔐 Red Hat Registry Authentication", expanded=True):
+        st.markdown("""
+        請輸入您的 Red Hat 帳號以登入 `registry.redhat.io`。
+        這將用於後續獲取 Operator Hub 的 Catalog 資訊。
+        
+        > 💡 **提示**：如果您沒有 Red Hat 帳號，可以註冊免費的 [Red Hat Developer 帳號](https://developers.redhat.com/register)
+        """)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            rh_username = st.text_input(
+                "Red Hat Username", 
+                placeholder="您的 Red Hat 帳號",
+                key="rh_username_input"
+            )
+        with col2:
+            rh_password = st.text_input(
+                "Red Hat Password", 
+                type="password",
+                placeholder="您的 Red Hat 密碼或 Service Account Token",
+                key="rh_password_input"
+            )
+        
+        # 儲存認證資訊到 session_state
+        if rh_username and rh_password:
+            st.session_state.rh_username = rh_username
+            st.session_state.rh_password = rh_password
+        
+        # 登入按鈕
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            login_button = st.button("🔑 Login to Registry", type="primary", key="registry_login_btn")
+        with col2:
+            test_button = st.button("🔄 Test Login", key="registry_test_btn")
+        
+        if login_button:
+            if not rh_username or not rh_password:
+                st.error("請輸入 Username 和 Password")
+            else:
+                with st.spinner("正在登入 registry.redhat.io..."):
+                    result, message = wizard.login_registry(rh_username, rh_password)
+                    if result:
+                        st.success(message)
+                        st.session_state.registry_logged_in = True
+                    else:
+                        st.error(message)
+                        st.session_state.registry_logged_in = False
+        
+        if test_button:
+            if not st.session_state.get('registry_logged_in', False):
+                st.warning("請先登入 Registry")
+            else:
+                with st.spinner("測試登入狀態..."):
+                    result, message = wizard.test_registry_login()
+                    if result:
+                        st.success(message)
+                    else:
+                        st.error(message)
+
+        # 顯示登入狀態
+        if st.session_state.get('registry_logged_in', False):
+            st.success("✅ 已成功登入 registry.redhat.io")
+        else:
+            st.info("ℹ️ 尚未登入 registry.redhat.io")
+
+    st.divider()
+
     with st.form("tool_config_form"):
         st.subheader("Version Information")
         col1, col2 = st.columns(2)
@@ -126,6 +195,202 @@ def show_tool_config_page():
                         st.success("✅ tool_config 配置完成！")
                     else:
                         log_error("❌ untar_oc_mirror 失敗")
+
+    # Step 4: fetch_operator_catalog
+    with st.expander("Step 4: Fetch Operator Catalog", expanded=True):
+        # 檢查條件：tools_downloaded 且 oc-mirror 已解壓
+        oc_mirror_binary = os.path.join(os.path.expanduser("~"), ".local/bin/oc-mirror")
+        if not os.path.exists(oc_mirror_binary):
+            oc_mirror_binary = os.path.join(CURRENT_DIR, "usr/bin/oc-mirror")
+        
+        if st.session_state.tools_downloaded and os.path.exists(oc_mirror_binary):
+            catalog_file = os.path.join(CURRENT_DIR, "operator_catalog.json")
+            
+            if os.path.exists(catalog_file):
+                # 顯示現有快取資訊
+                try:
+                    with open(catalog_file, 'r') as f:
+                        catalog_data = json.load(f)
+                        fetched_at = catalog_data.get('fetched_at', 'Unknown')
+                        package_count = sum(
+                            cat_info.get('package_count', 0) 
+                            for cat_info in catalog_data.get('catalogs', {}).values()
+                        )
+                    
+                    col1, col2, col3 = st.columns([2, 1, 1])
+                    with col1:
+                        st.success(f"✅ Operator Catalog 就緒 ({package_count} packages)")
+                    with col2:
+                        st.caption(f"🕐 {fetched_at[:19]}")
+                    with col3:
+                        refresh_btn = st.button("🔄 刷新", key="refresh_catalog_btn", use_container_width=True)
+                    
+                    if refresh_btn:
+                        # 使用 st.status 並傳入回調函數，加入動畫效果
+                        with st.status("🔄 正在刷新 Operator Catalog...", expanded=True) as status_container:
+                            
+                            # 建立進度顯示元件
+                            progress_bar = st.progress(0, "準備中...")
+                            status_text = st.empty()
+                            log_container = st.container()
+                            
+                            # 定義回調函數，用於更新狀態顯示
+                            def update_status(msg):
+                                """更新狀態訊息，同時模擬進度更新"""
+                                with log_container:
+                                    st.write(f"➤ {msg}")
+                                
+                                # 根據訊息內容更新進度
+                                if "初始化" in msg:
+                                    progress_bar.progress(5, "初始化中...")
+                                elif "oc-mirror" in msg and "找到" in msg:
+                                    progress_bar.progress(15, "已找到工具")
+                                elif "認證" in msg:
+                                    progress_bar.progress(25, "檢查認證...")
+                                elif "連接到" in msg:
+                                    progress_bar.progress(35, "連接 Registry...")
+                                elif "執行" in msg:
+                                    progress_bar.progress(40, "執行查詢中...")
+                                    status_text.info("⏳ 正在從 Red Hat Registry 拉取 Operator 列表，請耐心等待...")
+                                elif "解析" in msg:
+                                    progress_bar.progress(75, "解析資料中...")
+                                elif "找到" in msg and "packages" in msg:
+                                    progress_bar.progress(90, "處理資料中...")
+                                elif "儲存" in msg:
+                                    progress_bar.progress(95, "儲存快取...")
+                                elif "完成" in msg:
+                                    progress_bar.progress(100, "完成!")
+                            
+                            # 執行獲取任務
+                            if wizard.run_get_operator_catalog(config, status_callback=update_status):
+                                progress_bar.progress(100, "完成!")
+                                status_text.success("✅ 所有任務完成!")
+                                status_container.update(
+                                    label="✅ Operator Catalog 刷新完成!", 
+                                    state="complete", 
+                                    expanded=False
+                                )
+                                log_success("✅ Operator Catalog 刷新完成")
+                                st.balloons()
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                progress_bar.empty()
+                                status_text.empty()
+                                status_container.update(
+                                    label="❌ 刷新失敗", 
+                                    state="error", 
+                                    expanded=True
+                                )
+                                st.error("❌ Operator Catalog 刷新失敗")
+                                st.error("請確認網路連線和認證狀態")
+                                log_error("❌ Operator Catalog 刷新失敗")
+                                                    
+                except Exception as e:
+                    st.error(f"讀取快取失敗: {e}")
+            else:
+                # 首次獲取 - 使用動畫和進度條
+                st.info("📡 尚未獲取 Operator Catalog")
+                st.markdown("""
+                獲取 Operator Catalog 可以讓您在後續步驟中：
+                - 🔍 快速瀏覽可用的 Operators
+                - ⚡ 即時選擇需要的套件
+                - 📦 無需等待即可配置
+                
+                首次獲取約需 **3-5 分鐘**，請耐心等待。
+                """)
+                
+                if st.button("🚀 開始獲取 Operator Catalog", type="primary", use_container_width=True):
+                    # 建立任務狀態容器
+                    with st.status("📡 正在獲取 Operator Catalog...", expanded=True) as status_container:
+                        
+                        # 建立進度顯示元件
+                        progress_bar = st.progress(0, "準備開始...")
+                        status_text = st.empty()
+                        log_container = st.container()
+                        
+                        # 顯示動畫提示
+                        status_text.info("🔍 初始化任務...")
+                        
+                        # 定義回調函數，加入詳細的進度更新
+                        def update_status(msg):
+                            """更新狀態訊息，同時更新進度條"""
+                            # 在日誌容器中顯示訊息
+                            with log_container:
+                                st.write(f"➤ {msg}")
+                            
+                            # 根據關鍵字更新進度條
+                            if "初始化" in msg:
+                                progress_bar.progress(5, "初始化任務...")
+                                status_text.info("🔍 正在初始化獲取任務...")
+                            elif "版本" in msg:
+                                progress_bar.progress(10, "讀取版本資訊...")
+                            elif "尋找" in msg and "oc-mirror" in msg:
+                                progress_bar.progress(15, "尋找 oc-mirror...")
+                            elif "找到" in msg and "oc-mirror" in msg:
+                                progress_bar.progress(20, "已找到 oc-mirror")
+                                status_text.info("✅ 工具已就緒")
+                            elif "認證" in msg:
+                                progress_bar.progress(25, "檢查認證...")
+                                status_text.info("🔐 檢查 Red Hat Registry 認證...")
+                            elif "認證文件存在" in msg:
+                                progress_bar.progress(30, "認證通過")
+                            elif "連接到" in msg:
+                                progress_bar.progress(35, "連接 Registry...")
+                                status_text.info("📡 正在連接到 Red Hat Registry...")
+                            elif "執行" in msg:
+                                progress_bar.progress(40, "執行查詢命令...")
+                                status_text.info("⏳ 正在執行 oc-mirror 查詢，這需要一些時間...")
+                                # 顯示等待動畫（使用 spinner）
+                                with st.spinner("🔄 從 Red Hat Registry 拉取 Operator 列表..."):
+                                    pass
+                            elif "解析" in msg:
+                                progress_bar.progress(75, "解析資料...")
+                                status_text.info("📊 正在解析 Operator 列表...")
+                            elif "找到" in msg and "packages" in msg:
+                                progress_bar.progress(90, "處理完成")
+                                status_text.success(f"📦 {msg}")
+                            elif "儲存" in msg:
+                                progress_bar.progress(95, "儲存快取...")
+                                status_text.info("💾 正在儲存快取檔案...")
+                            elif "完成" in msg:
+                                progress_bar.progress(100, "完成!")
+                                status_text.success("✅ 所有任務完成!")
+                        
+                        # 執行獲取任務
+                        success = wizard.run_get_operator_catalog(config, status_callback=update_status)
+                        
+                        if success:
+                            progress_bar.progress(100, "完成!")
+                            status_text.success("🎉 Operator Catalog 獲取完成!")
+                            status_container.update(
+                                label="✅ Operator Catalog 獲取完成!", 
+                                state="complete", 
+                                expanded=False
+                            )
+                            log_success("✅ Operator Catalog 獲取完成")
+                            st.balloons()
+                            time.sleep(1.5)
+                            st.rerun()
+                        else:
+                            progress_bar.empty()
+                            status_text.empty()
+                            log_container.empty()
+                            status_container.update(
+                                label="❌ 獲取失敗", 
+                                state="error", 
+                                expanded=True
+                            )
+                            st.error("❌ Operator Catalog 獲取失敗")
+                            st.markdown("""
+                            ### 可能的解決方法：
+                            1. 🔐 確認已成功登入 Red Hat Registry
+                            2. 🌐 檢查網路連線是否正常
+                            3. ⏱️ 嘗試增加 timeout 設定
+                            4. 🔄 重新整理頁面後再試
+                            """)
+                            log_error("❌ Operator Catalog 獲取失敗")
+
     # 下一步按鈕
     if st.session_state.tools_downloaded:
         st.divider()
@@ -175,6 +440,13 @@ def show_cluster_config_page():
         if not match:
             return False
         return all(0 <= int(g) <= 255 for g in match.groups())
+
+    def is_valid_mac(mac):
+        """驗證 MAC Address 格式"""
+        if not mac:
+            return True  # 空值不算錯誤
+        pattern = r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
+        return bool(re.match(pattern, mac))
 
     st.subheader("Cluster Identity")
     col1, col2, col3 = st.columns(3)
@@ -269,12 +541,25 @@ def show_cluster_config_page():
     # 動態生成 Master IP 輸入框
     for i in range(1, st.session_state.master_count + 1):
         ip_key = f"MASTER{i:02d}_IP"
+        mac_key = f"MASTER{i:02d}_MAC"
+        iface_key = f"MASTER{i:02d}_INTERFACE"
+        device_key = f"MASTER{i:02d}_DEVICE"
+
         state_key = f"ip_{ip_key}"
+        mac_state_key = f"mac_{mac_key}"
+        iface_state_key = f"iface_{iface_key}"
+        device_state_key = f"device_{device_key}"
         
         if state_key not in st.session_state:
             st.session_state[state_key] = config['install_env'].get(ip_key, "")
-        
-        col1, col2 = st.columns([4, 1])
+        if mac_state_key not in st.session_state:
+            st.session_state[mac_state_key] = config['install_env'].get(mac_key, "BC:24:11:99:B8:1B")
+        if iface_state_key not in st.session_state:
+            st.session_state[iface_state_key] = config['install_env'].get(iface_key, "ens18")
+        if device_state_key not in st.session_state:
+            st.session_state[device_state_key] = config['install_env'].get(device_key, "/dev/sda")
+
+        col1, col2, col3, col4 = st.columns([3, 3, 2, 2])
         with col1:
             ip_value = st.text_input(
                 f"Master {i:02d} IP",
@@ -282,11 +567,38 @@ def show_cluster_config_page():
                 key=f"input_{ip_key}"
             )
         with col2:
-            if ip_value and not is_valid_ipv4(ip_value):
-                st.error("❌ Invalid IP")
+            mac_value = st.text_input(
+                f"Master {i:02d} MAC",
+                value=st.session_state[mac_state_key],
+                key=f"input_{mac_key}"
+            )
+        with col3:
+            iface_value = st.text_input(
+                f"Master {i:02d} Interface",
+                value=st.session_state[iface_state_key],
+                key=f"input_{iface_key}"
+            )
+        with col4:
+            device_value = st.text_input(
+                f"Master {i:02d} Device",
+                value=st.session_state[device_state_key],
+                key=f"input_{device_key}"
+            )
+
+        # Validation
+        if ip_value and not is_valid_ipv4(ip_value):
+            st.error("❌ Invalid IP")
+        if mac_value and not is_valid_mac(mac_value):
+            st.error("❌ Invalid MAC")
         
         st.session_state[state_key] = ip_value
+        st.session_state[mac_state_key] = mac_value
+        st.session_state[iface_state_key] = iface_value
+        st.session_state[device_state_key] = device_value
         config['install_env'][ip_key] = ip_value
+        config['install_env'][mac_key] = mac_value
+        config['install_env'][iface_key] = iface_value
+        config['install_env'][device_key] = device_value
 
     # ===== Infra Node Count (在 form 外部) =====
     st.markdown("#### Infra Nodes")
@@ -325,12 +637,25 @@ def show_cluster_config_page():
     # 動態生成 Infra IP 輸入框
     for i in range(1, st.session_state.infra_count + 1):
         ip_key = f"INFRA{i:02d}_IP"
+        mac_key = f"INFRA{i:02d}_MAC"
+        iface_key = f"INFRA{i:02d}_INTERFACE"
+        device_key = f"INFRA{i:02d}_DEVICE"
+
         state_key = f"ip_{ip_key}"
+        mac_state_key = f"mac_{mac_key}"
+        iface_state_key = f"iface_{iface_key}"
+        device_state_key = f"device_{device_key}"
         
         if state_key not in st.session_state:
             st.session_state[state_key] = config['install_env'].get(ip_key, "")
-        
-        col1, col2 = st.columns([4, 1])
+        if mac_state_key not in st.session_state:
+            st.session_state[mac_state_key] = config['install_env'].get(mac_key, "BC:24:11:99:B8:1B")
+        if iface_state_key not in st.session_state:
+            st.session_state[iface_state_key] = config['install_env'].get(iface_key, "ens18")
+        if device_state_key not in st.session_state:
+            st.session_state[device_state_key] = config['install_env'].get(device_key, "/dev/sda")
+
+        col1, col2, col3, col4 = st.columns([3, 3, 2, 2])
         with col1:
             ip_value = st.text_input(
                 f"INFRA {i:02d} IP",
@@ -338,11 +663,38 @@ def show_cluster_config_page():
                 key=f"input_{ip_key}"
             )
         with col2:
-            if ip_value and not is_valid_ipv4(ip_value):
-                st.error("❌ Invalid IP")
+            mac_value = st.text_input(
+                f"INFRA {i:02d} MAC",
+                value=st.session_state[mac_state_key],
+                key=f"input_{mac_key}"
+            )
+        with col3:
+            iface_value = st.text_input(
+                f"INFRA {i:02d} Interface",
+                value=st.session_state[iface_state_key],
+                key=f"input_{iface_key}"
+            )
+        with col4:
+            device_value = st.text_input(
+                f"INFRA {i:02d} Device",
+                value=st.session_state[device_state_key],
+                key=f"input_{device_key}"
+            )
+
+        # Validation
+        if ip_value and not is_valid_ipv4(ip_value):
+            st.error("❌ Invalid IP")
+        if mac_value and not is_valid_mac(mac_value):
+            st.error("❌ Invalid MAC")
         
         st.session_state[state_key] = ip_value
+        st.session_state[mac_state_key] = mac_value
+        st.session_state[iface_state_key] = iface_value
+        st.session_state[device_state_key] = device_value
         config['install_env'][ip_key] = ip_value
+        config['install_env'][mac_key] = mac_value
+        config['install_env'][iface_key] = iface_value
+        config['install_env'][device_key] = device_value
 
     # ===== Worker Node Count (在 form 外部) =====
     st.markdown("#### Worker Nodes")
@@ -381,12 +733,25 @@ def show_cluster_config_page():
     # 動態生成 Worker IP 輸入框
     for i in range(1, st.session_state.worker_count + 1):
         ip_key = f"WORKER{i:02d}_IP"
+        mac_key = f"WORKER{i:02d}_MAC"
+        iface_key = f"WORKER{i:02d}_INTERFACE"
+        device_key = f"WORKER{i:02d}_DEVICE"
+
         state_key = f"ip_{ip_key}"
+        mac_state_key = f"mac_{mac_key}"
+        iface_state_key = f"iface_{iface_key}"
+        device_state_key = f"device_{device_key}"
         
         if state_key not in st.session_state:
             st.session_state[state_key] = config['install_env'].get(ip_key, "")
-        
-        col1, col2 = st.columns([4, 1])
+        if mac_state_key not in st.session_state:
+            st.session_state[mac_state_key] = config['install_env'].get(mac_key, "BC:24:11:99:B8:1B")
+        if iface_state_key not in st.session_state:
+            st.session_state[iface_state_key] = config['install_env'].get(iface_key, "ens18")
+        if device_state_key not in st.session_state:
+            st.session_state[device_state_key] = config['install_env'].get(device_key, "/dev/sda")
+
+        col1, col2, col3, col4 = st.columns([3, 3, 2, 2])
         with col1:
             ip_value = st.text_input(
                 f"Worker {i:02d} IP",
@@ -394,17 +759,44 @@ def show_cluster_config_page():
                 key=f"input_{ip_key}"
             )
         with col2:
-            if ip_value and not is_valid_ipv4(ip_value):
-                st.error("❌ Invalid IP")
+            mac_value = st.text_input(
+                f"Worker {i:02d} MAC",
+                value=st.session_state[mac_state_key],
+                key=f"input_{mac_key}"
+            )
+        with col3:
+            iface_value = st.text_input(
+                f"Worker {i:02d} Interface",
+                value=st.session_state[iface_state_key],
+                key=f"input_{iface_key}"
+            )
+        with col4:
+            device_value = st.text_input(
+                f"Worker {i:02d} Device",
+                value=st.session_state[device_state_key],
+                key=f"input_{device_key}"
+            )
+
+        # Validation
+        if ip_value and not is_valid_ipv4(ip_value):
+            st.error("❌ Invalid IP")
+        if mac_value and not is_valid_mac(mac_value):
+            st.error("❌ Invalid MAC")
         
         st.session_state[state_key] = ip_value
+        st.session_state[mac_state_key] = mac_value
+        st.session_state[iface_state_key] = iface_value
+        st.session_state[device_state_key] = device_value
         config['install_env'][ip_key] = ip_value
+        config['install_env'][mac_key] = mac_value
+        config['install_env'][iface_key] = iface_value
+        config['install_env'][device_key] = device_value
 
     # ===== 將提交部分包在 form 內 =====
     st.divider()
     with st.form("cluster_config_form"):
         st.subheader("Other IPs")
-        col_bast, col_boot = st.columns(2)
+        col_bast, col_boot, col_gw = st.columns(3)
         with col_bast:
             bastion_ip = st.text_input(
                 "Bastion IP", 
@@ -414,6 +806,15 @@ def show_cluster_config_page():
             if bastion_ip and not is_valid_ipv4(bastion_ip):
                 st.error("❌ Invalid IP")
             config['install_env']['BASTION_IP'] = bastion_ip
+        with col_gw:
+            gateway_ip = st.text_input(
+                "Gateway IP",
+                value=config['install_env'].get('GATEWAY_IP', ''),
+                key="gateway_ip_input"
+            )
+            if gateway_ip and not is_valid_ipv4(gateway_ip):
+                st.error("❌ Invalid IP")
+            config['install_env']['GATEWAY_IP'] = gateway_ip
         with col_boot:
             bootstrap_ip = st.text_input(
                 "Bootstrap IP (optional)", 
@@ -513,18 +914,36 @@ def show_cluster_config_page():
                 st.error("Registry Password 不能為空")
             else:
                 try:
-                    # 同步所有 node IP (確保 form 外的值被保存)
+                    # 同步所有 node IP, MAC, Interface, Device (確保 form 外的值被保存)
                     for i in range(1, st.session_state.master_count + 1):
                         ip_key = f"MASTER{i:02d}_IP"
+                        mac_key = f"MASTER{i:02d}_MAC"
+                        iface_key = f"MASTER{i:02d}_INTERFACE"
+                        device_key = f"MASTER{i:02d}_DEVICE"
                         config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                        config['install_env'][mac_key] = st.session_state.get(f"mac_{mac_key}", "")
+                        config['install_env'][iface_key] = st.session_state.get(f"iface_{iface_key}", "")
+                        config['install_env'][device_key] = st.session_state.get(f"device_{device_key}", "")
                     
                     for i in range(1, st.session_state.infra_count + 1):
                         ip_key = f"INFRA{i:02d}_IP"
+                        mac_key = f"INFRA{i:02d}_MAC"
+                        iface_key = f"INFRA{i:02d}_INTERFACE"
+                        device_key = f"INFRA{i:02d}_DEVICE"
                         config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                        config['install_env'][mac_key] = st.session_state.get(f"mac_{mac_key}", "")
+                        config['install_env'][iface_key] = st.session_state.get(f"iface_{iface_key}", "")
+                        config['install_env'][device_key] = st.session_state.get(f"device_{device_key}", "")
                     
                     for i in range(1, st.session_state.worker_count + 1):
                         ip_key = f"WORKER{i:02d}_IP"
+                        mac_key = f"WORKER{i:02d}_MAC"
+                        iface_key = f"WORKER{i:02d}_INTERFACE"
+                        device_key = f"WORKER{i:02d}_DEVICE"
                         config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                        config['install_env'][mac_key] = st.session_state.get(f"mac_{mac_key}", "")
+                        config['install_env'][iface_key] = st.session_state.get(f"iface_{iface_key}", "")
+                        config['install_env'][device_key] = st.session_state.get(f"device_{device_key}", "")
                     
                     config_manager.save_config(config)
                     
@@ -538,13 +957,23 @@ def show_cluster_config_page():
                     
                     with open(output_path, 'w') as f:
                         f.write(yaml_content)
-                    
+
+                    # 生成 AgentConfig
+                    agent_yaml_content = generator.generate_agent_config()
+                    agent_output_path = os.path.join(CURRENT_DIR, "install/ocp/agent-config.yaml")
+                    with open(agent_output_path, 'w') as f:
+                        f.write(agent_yaml_content)
+
                     st.session_state.cluster_configured = True
                     st.success(f"✅ Configuration saved & `install-config.yaml` generated!")
-                    
+                    st.success(f"✅ `agent-config.yaml` generated!")
+
                     with st.expander("Preview install-config.yaml"):
                         st.code(yaml_content, language="yaml")
-                        
+
+                    with st.expander("Preview agent-config.yaml"):
+                        st.code(agent_yaml_content, language="yaml")
+
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
 
@@ -570,7 +999,7 @@ def show_operators_page():
     with st.expander("🖥️ CSI Driver Configuration", expanded=True):
         csi_type = st.selectbox(
             "Select CSI Type", 
-            ["nfs-csi", "trident", "aws-ebs-csi", "vsphere-csi", "none"], 
+            ["nfs-csi", "trident", "none"], 
             index=0 if st.session_state.csi_config['CSI_TYPE'] == 'nfs-csi' else (1 if st.session_state.csi_config['CSI_TYPE'] == 'trident' else 2)
         )
         st.session_state.csi_config['CSI_TYPE'] = csi_type
@@ -585,105 +1014,201 @@ def show_operators_page():
     # --- Operator 選擇區塊 ---
     operator_tools = OperatorTools()
     
-    if not os.path.exists(os.path.join(CURRENT_DIR, 'usr/bin/oc-mirror')) and not os.path.exists('/usr/bin/oc-mirror'):
-        st.warning("⚠️ 未找到 oc-mirror，請確認第一步環境初始化已成功執行。")
-        # 嘗試在当前目录查找
-        oc_mirror_path = os.path.join(CURRENT_DIR, 'usr/bin/oc-mirror')
-        if not os.path.exists(oc_mirror_path):
-             st.error(f"找不到 oc-mirror 於 {CURRENT_DIR}/usr/bin 或 /usr/bin")
-             return
+    # 檢查 oc-mirror 是否可用
+    try:
+        ocp_version = operator_tools.get_ocp_version()
+        st.info(f"🎯 Target OCP Version: **{ocp_version}**")
+    except Exception:
+        st.warning("⚠️ 無法讀取 OCP 版本，將使用預設值 4.20")
+        ocp_version = "4.20"
 
     st.divider()
-    st.subheader("Operator Hub Selection")
+    st.subheader("📦 Operator Hub Selection")
     
-    # 獲取 Catalogs
-    with st.spinner("Fetching available catalogs..."):
+    # 獲取 Catalogs (需求1)
+    with st.spinner("🔍 Fetching available catalogs from registry..."):
         try:
             catalogs = operator_tools.get_catalogs()
             if not catalogs:
-                catalogs = ["registry.redhat.io/redhat/redhat-operator-index:v4.20"]
+                st.error("❌ 無法獲取 catalogs，請檢查網路連接和 oc-mirror 配置")
+                return
+            st.success(f"✅ Found {len(catalogs)} catalogs")
         except Exception as e:
-            st.error(f"Error fetching catalogs: {str(e)}")
-            catalogs = []
+            st.error(f"❌ Error fetching catalogs: {str(e)}")
+            st.info("💡 請確保 oc-mirror 已正確安裝並可訪問 Red Hat Registry")
+            return
 
-    selected_catalog = st.selectbox("Select Catalog", catalogs) if catalogs else ""
+    # Catalog 選擇
+    selected_catalog = st.selectbox(
+        "Select Catalog", 
+        catalogs,
+        key="catalog_select",
+        help="選擇要瀏覽的 Operator Catalog"
+    )
     
     if selected_catalog:
-        if st.button("Load Packages"):
-            with st.spinner("Fetching packages..."):
+        # Load Packages 按鈕 (需求2)
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            load_packages = st.button("🔍 Load Packages", type="primary", key="load_packages_btn")
+        
+        if load_packages:
+            with st.spinner(f"📥 Fetching packages from {selected_catalog.split('/')[-1]}..."):
                 try:
                     packages = operator_tools.get_packages(selected_catalog)
-                    st.session_state.available_packages = packages
+                    if packages:
+                        st.session_state.available_packages = packages
+                        st.success(f"✅ Loaded {len(packages)} packages")
+                    else:
+                        st.error("❌ No packages found or failed to fetch")
+                        st.session_state.available_packages = []
                 except Exception as e:
-                    st.error(f"Error fetching packages: {str(e)}")
+                    st.error(f"❌ Error fetching packages: {str(e)}")
+                    st.session_state.available_packages = []
         
-        if 'available_packages' in st.session_state:
-            selected_packages = st.multiselect("Select Packages to Include", st.session_state.available_packages)
+        # 顯示可用 packages (需求3)
+        if 'available_packages' in st.session_state and st.session_state.available_packages:
+            st.markdown("---")
+            st.markdown("### Select Packages")
+            
+            # 搜索過濾
+            search_term = st.text_input("🔎 Search packages", key="package_search")
+            
+            filtered_packages = st.session_state.available_packages
+            if search_term:
+                filtered_packages = [p for p in filtered_packages if search_term.lower() in p.lower()]
+            
+            selected_packages = st.multiselect(
+                f"Select Packages ({len(filtered_packages)} available)",
+                filtered_packages,
+                key="package_multiselect",
+                help="選擇要包含在 imageset 中的 operators"
+            )
             
             if selected_packages:
-                st.session_state.selected_operators = []
-                st.markdown("#### Configure Versions")
+                st.markdown("---")
+                st.markdown("### ⚙️ Configure Selected Operators")
                 
+                # 初始化 operator_configs
+                if 'operator_configs' not in st.session_state:
+                    st.session_state.operator_configs = {}
+                
+                # 為每個選中的 package 配置 channel 和版本
                 for pkg in selected_packages:
-                    with st.expander(f"Package: {pkg}"):
-                        with st.spinner(f"Fetching versions for {pkg}..."):
+                    with st.expander(f"📦 {pkg}", expanded=True):
+                        # 獲取 channels
+                        with st.spinner(f"Fetching channels for {pkg}..."):
                             try:
-                                versions = operator_tools.get_package_versions(selected_catalog, pkg)
-                                if versions:
-                                    col1, col2 = st.columns([3, 1])
-                                    with col1:
-                                        min_v = st.selectbox("Min Version", versions, key=f"{pkg}_min", index=len(versions)-1)
-                                        max_v = st.selectbox("Max Version", versions, key=f"{pkg}_max", index=len(versions)-1)
-                                    with col2:
-                                        st.write("Channel: stable") 
+                                channel_info = operator_tools.get_package_channels(selected_catalog, pkg)
+                                
+                                if channel_info['channels']:
+                                    # Channel 選擇
+                                    channel_names = [ch['name'] for ch in channel_info['channels']]
+                                    default_channel = channel_info.get('default_channel', channel_names[0])
+                                    default_index = channel_names.index(default_channel) if default_channel in channel_names else 0
                                     
-                                    st.session_state.selected_operators.append({
-                                        "name": pkg,
-                                        "channel": "stable",
-                                        "minVersion": min_v,
-                                        "maxVersion": max_v
-                                    })
+                                    selected_channel = st.selectbox(
+                                        "Channel",
+                                        channel_names,
+                                        index=default_index,
+                                        key=f"{pkg}_channel"
+                                    )
+                                    
+                                    # 獲取該 channel 的版本
+                                    with st.spinner(f"Fetching versions for {selected_channel}..."):
+                                        versions = operator_tools.get_channel_versions(
+                                            selected_catalog, pkg, selected_channel
+                                        )
+                                    
+                                    if versions:
+                                        col1, col2 = st.columns(2)
+                                        with col1:
+                                            min_version = st.selectbox(
+                                                "Min Version",
+                                                versions,
+                                                index=len(versions)-1,  # 預設選最新版本
+                                                key=f"{pkg}_min_version"
+                                            )
+                                        with col2:
+                                            max_version = st.selectbox(
+                                                "Max Version",
+                                                versions,
+                                                index=len(versions)-1,  # 預設選最新版本
+                                                key=f"{pkg}_max_version"
+                                            )
+                                        
+                                        # 存儲配置
+                                        st.session_state.operator_configs[pkg] = {
+                                            "name": pkg,
+                                            "channel": selected_channel,
+                                            "minVersion": min_version,
+                                            "maxVersion": max_version
+                                        }
+                                        
+                                        st.success(f"✅ {pkg}: {selected_channel} ({min_version} - {max_version})")
+                                    else:
+                                        st.warning(f"⚠️ No versions found for channel {selected_channel}")
                                 else:
-                                    st.warning(f"No versions found for {pkg}")
+                                    st.warning(f"⚠️ No channels found for {pkg}")
+                                    
                             except Exception as e:
-                                st.error(f"Error fetching versions for {pkg}: {str(e)}")
+                                st.error(f"❌ Error configuring {pkg}: {str(e)}")
                 
-                if st.button("💾 Save operators.json & Generate Imageset"):
-                    # 1. 保存 operators.json
-                    ops_path = os.path.join(CURRENT_DIR, 'operators.json')
-                    with open(ops_path, 'w') as f:
-                        json.dump(st.session_state.selected_operators, f, indent=2)
-                    
-                    # 2. 合併 CSI 配置到臨時 config 供生成器使用
-                    # 讀取 cluster_config 作為基礎
-                    cluster_mgr = ConfigManager('cluster_config.json')
-                    full_config = cluster_mgr.get_config()
-                    # 注入 CSI 配置
-                    full_config['csi_info'] = st.session_state.csi_config
-                    
-                    # 3. 生成 imageset-config.yaml
-                    try:
-                        from yaml_generator import YAMLGenerator
-                        generator = YAMLGenerator(full_config, CURRENT_DIR)
-                        yaml_content = generator.generate_imageset_config()
+                # 保存按鈕
+                st.markdown("---")
+                if st.button("💾 Save operators.json & Generate Imageset", type="primary", use_container_width=True):
+                    if st.session_state.operator_configs:
+                        # 1. 準備 operators 數據
+                        operators_list = []
+                        for pkg_name, config in st.session_state.operator_configs.items():
+                            operators_list.append({
+                                "name": config["name"],
+                                "channels": [{
+                                    "name": config["channel"],
+                                    "minVersion": config["minVersion"],
+                                    "maxVersion": config["maxVersion"]
+                                }]
+                            })
                         
-                        output_path = os.path.join(CURRENT_DIR, "install/ocp", "imageset-config.yaml")
-                        with open(output_path, 'w') as f:
-                            f.write(yaml_content)
+                        # 2. 保存 operators.json
+                        ops_path = os.path.join(CURRENT_DIR, 'operators.json')
+                        with open(ops_path, 'w') as f:
+                            json.dump(operators_list, f, indent=2)
                         
-                        st.session_state.operators_saved = True
-                        st.success(f"✅ `operators.json` & `imageset-config.yaml` generated!<br>Path: `{output_path}`", unsafe_allow_html=True)
+                        # 3. 合併 CSI 配置
+                        cluster_mgr = ConfigManager('cluster_config.json')
+                        full_config = cluster_mgr.get_config()
+                        full_config['csi_info'] = st.session_state.csi_config
+                        full_config['operators'] = operators_list
                         
-                        with st.expander("Preview imageset-config.yaml"):
-                            st.code(yaml_content, language="yaml")
+                        # 4. 生成 imageset-config.yaml
+                        try:
+                            from yaml_generator import YAMLGenerator
+                            generator = YAMLGenerator(full_config, CURRENT_DIR)
+                            yaml_content = generator.generate_imageset_config()
                             
-                    except Exception as e:
-                        st.error(f"Error generating imageset: {str(e)}")
+                            output_path = os.path.join(CURRENT_DIR, "install/ocp", "imageset-config.yaml")
+                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                            
+                            with open(output_path, 'w') as f:
+                                f.write(yaml_content)
+                            
+                            st.session_state.operators_saved = True
+                            st.success(f"✅ Configuration saved! Files generated:")
+                            st.info(f"📄 `operators.json`\n📄 `imageset-config.yaml`")
+                            
+                            with st.expander("Preview imageset-config.yaml"):
+                                st.code(yaml_content, language="yaml")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error generating imageset: {str(e)}")
+                    else:
+                        st.warning("⚠️ Please configure at least one operator")
 
     # 下一步按鈕
     if os.path.exists(os.path.join(CURRENT_DIR, 'operators.json')):
         st.divider()
-        if st.button("➡️ Next: Final Review", use_container_width=True):
+        if st.button("➡️ Next: Final Review", use_container_width=True, type="primary"):
             st.session_state.current_view = 'review'
             st.rerun()
 

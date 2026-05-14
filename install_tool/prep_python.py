@@ -1,7 +1,12 @@
+from logging import config
+from re import match
+import re
+
 import streamlit as st
 import json
 import os
 import sys
+import re
 from datetime import datetime
 
 # 導入自定義模組
@@ -135,143 +140,392 @@ def show_cluster_config_page():
     config_manager = ConfigManager('cluster_config.json')
     config = config_manager.get_config()
 
+    # 初始化節點計數 (只計算 _IP 結尾的配置)
     if 'master_count' not in st.session_state:
-        st.session_state.master_count = sum(1 for k in config['install_env'] if k.startswith('MASTER'))
+        st.session_state.master_count = max(1, sum(1 for k in config['install_env'] if k.startswith('MASTER') and k.endswith('_IP')))
     if 'infra_count' not in st.session_state:
-        st.session_state.infra_count = sum(1 for k in config['install_env'] if k.startswith('INFRA'))
+        st.session_state.infra_count = sum(1 for k in config['install_env'] if k.startswith('INFRA') and k.endswith('_IP'))
     if 'worker_count' not in st.session_state:
-        st.session_state.worker_count = sum(1 for k in config['install_env'] if k.startswith('WORKER'))
+        st.session_state.worker_count = sum(1 for k in config['install_env'] if k.startswith('WORKER') and k.endswith('_IP'))
 
-    with st.form("cluster_config_form"):
-        st.subheader("Cluster Identity")
-        col1, col2 = st.columns(2)
-        with col1:
-            config['install_env']['INSTALL_MODE'] = st.selectbox("Install Mode", ["standard", "compact", "sno"], index=["standard", "compact", "sno"].index(config['install_env']['INSTALL_MODE']))
-            config['install_env']['CLUSTER_DOMAIN'] = st.text_input("Cluster Name (metadata.name)", value=config['install_env']['CLUSTER_DOMAIN'], help="例如：ocp4")
-        with col2:
-            config['install_env']['BASE_DOMAIN'] = st.text_input("Base Domain", value=config['install_env']['BASE_DOMAIN'], help="例如：demo.lab")
+    # 確保計數至少為 1 (Master) 或 0 (Infra/Worker)
+    if st.session_state.master_count < 1:
+        st.session_state.master_count = 1
+
+    if 'version_info' not in config:
+        config['version_info'] = {}
+
+    if 'MACHINE_NETWORK_CIDR' not in config['install_env']:
+        config['install_env']['MACHINE_NETWORK_CIDR'] = ''
+    if 'CLUSTER_NETWORK_CIDR' not in config['install_env']:
+        config['install_env']['CLUSTER_NETWORK_CIDR'] = '10.128.0.0/14'
+    if 'CLUSTER_NETWORK_HOST_PREFIX' not in config['install_env']:
+        config['install_env']['CLUSTER_NETWORK_HOST_PREFIX'] = 23
+    if 'SERVICE_NETWORK_CIDR' not in config['install_env']:
+        config['install_env']['SERVICE_NETWORK_CIDR'] = '172.30.0.0/16'
+    if 'NETWORK_TYPE' not in config['install_env']:
+        config['install_env']['NETWORK_TYPE'] = 'OVNKubernetes'
+
+    def is_valid_ipv4(ip):
+        if not ip:
+            return True  # 空值不算錯誤
+        import re
+        pattern = r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$'
+        match = re.match(pattern, ip)
+        if not match:
+            return False
+        return all(0 <= int(g) <= 255 for g in match.groups())
+
+    st.subheader("Cluster Identity")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        config['install_env']['INSTALL_MODE'] = st.selectbox(
+            "Install Mode", 
+            ["standard", "compact", "sno"], 
+            index=["standard", "compact", "sno"].index(config['install_env']['INSTALL_MODE']),
+            key="install_mode_select"
+        )
+        
+    with col2:
+        config['install_env']['CLUSTER_DOMAIN'] = st.text_input(
+            "Cluster Name (metadata.name)", 
+            value=config['install_env']['CLUSTER_DOMAIN'], 
+            help="例如：ocp4",
+            key="cluster_domain_input"
+        )
+        
+    with col3:
+        config['install_env']['BASE_DOMAIN'] = st.text_input(
+            "Base Domain", 
+            value=config['install_env']['BASE_DOMAIN'], 
+            help="例如：demo.lab",
+            key="base_domain_input"
+        )
+
+    # 從 tool_config.json 讀取 OCP_RELEASE，自動解析版本
+    tool_config_manager = ConfigManager('tool_config.json')
+    tool_config = tool_config_manager.get_config()
+    ocp_release = tool_config.get('version_info', {}).get('OCP_RELEASE', '4.20.8')
+
+    # 解析主版本號 (例如: 4.20.8 -> 4.20)
+    match = re.match(r'(\d+\.\d+)', ocp_release)
+    if match:
+        ocp_version = match.group(1)
+    else:
+        ocp_version = '4.20'  # 預設值
+
+    config['version_info']['OCP_VERSION'] = ocp_version
+    config['version_info']['OCP_RELEASE'] = ocp_release
+
+    # 顯示當前的 OCP Version (只讀)
+    st.info(f"📦 OCP Version: **{ocp_version}** (Release: {ocp_release})")
+
+    cluster_name = config['install_env']['CLUSTER_DOMAIN'].split('.')[0] if '.' in config['install_env']['CLUSTER_DOMAIN'] else config['install_env']['CLUSTER_DOMAIN']
+    if cluster_name and config['install_env']['BASE_DOMAIN']:
+        registry_fqdn = f"bastion.{cluster_name}.{config['install_env']['BASE_DOMAIN']}"
+        st.info(f"📌 Registry URL will be: **{registry_fqdn}:8443**")
 
         st.divider()
         st.subheader("Network & Nodes")
 
-       # Master Node 配置
-        st.markdown("#### Master Nodes")
-        master_cols = st.columns([3, 1])
-        with master_cols[0]:
-            st.write(f"Current Master Count: {st.session_state.master_count}")
-        with master_cols[1]:
-            new_master_count = st.number_input(
-                "Master Count",
-                min_value=1,
-                max_value=3,
-                value=st.session_state.master_count,
-                key="master_count_input"
+    # ===== Master Node Count (在 form 外部) =====
+    st.markdown("#### Master Nodes")
+    master_cols = st.columns([3, 1])
+    with master_cols[0]:
+        st.write(f"Current Master Count: {st.session_state.master_count}")
+    with master_cols[1]:
+        new_master_count = st.number_input(
+            "Master Count",
+            min_value=1,
+            max_value=3,
+            value=st.session_state.master_count,
+            key="master_count_input"
+        )
+        # 直接比較並更新，不需要在 form 內
+        if new_master_count != st.session_state.master_count:
+            old_count = st.session_state.master_count
+            st.session_state.master_count = new_master_count
+            
+            # 清理多餘的 IP
+            for i in range(new_master_count + 1, old_count + 1):
+                ip_key = f"MASTER{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key in st.session_state:
+                    del st.session_state[state_key]
+                if ip_key in config['install_env']:
+                    del config['install_env'][ip_key]
+            
+            # 初始化新的 IP
+            for i in range(old_count + 1, new_master_count + 1):
+                ip_key = f"MASTER{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = ""
+            
+            # 保存 config
+            config_manager.save_config(config)
+            st.rerun()
+
+    # 動態生成 Master IP 輸入框
+    for i in range(1, st.session_state.master_count + 1):
+        ip_key = f"MASTER{i:02d}_IP"
+        state_key = f"ip_{ip_key}"
+        
+        if state_key not in st.session_state:
+            st.session_state[state_key] = config['install_env'].get(ip_key, "")
+        
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            ip_value = st.text_input(
+                f"Master {i:02d} IP",
+                value=st.session_state[state_key],
+                key=f"input_{ip_key}"
             )
-            if new_master_count != st.session_state.master_count:
-                st.session_state.master_count = new_master_count
-                st.rerun()
+        with col2:
+            if ip_value and not is_valid_ipv4(ip_value):
+                st.error("❌ Invalid IP")
+        
+        st.session_state[state_key] = ip_value
+        config['install_env'][ip_key] = ip_value
 
-        # 動態生成 Master IP 輸入框
-        for i in range(1, st.session_state.master_count + 1):
-            ip_key = f"MASTER{i:02d}_IP"
-            if ip_key not in config['install_env']:
-                config['install_env'][ip_key] = ""
-            config['install_env'][ip_key] = st.text_input(f"Master {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"master_{i}_ip")
+    # ===== Infra Node Count (在 form 外部) =====
+    st.markdown("#### Infra Nodes")
+    infra_cols = st.columns([3, 1])
+    with infra_cols[0]:
+        st.write(f"Current Infra Count: {st.session_state.infra_count}")
+    with infra_cols[1]:
+        new_infra_count = st.number_input(
+            "Infra Count",
+            min_value=0,
+            max_value=3,
+            value=st.session_state.infra_count,
+            key="infra_count_input"
+        )
+        if new_infra_count != st.session_state.infra_count:
+            old_count = st.session_state.infra_count
+            st.session_state.infra_count = new_infra_count
+            
+            for i in range(new_infra_count + 1, old_count + 1):
+                ip_key = f"INFRA{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key in st.session_state:
+                    del st.session_state[state_key]
+                if ip_key in config['install_env']:
+                    del config['install_env'][ip_key]
+            
+            for i in range(old_count + 1, new_infra_count + 1):
+                ip_key = f"INFRA{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = ""
+            
+            config_manager.save_config(config)
+            st.rerun()
 
-        # Infra Node 配置
-        st.markdown("#### Infra Nodes")
-        infra_cols = st.columns([3, 1])
-        with infra_cols[0]:
-            st.write(f"Current Infra Count: {st.session_state.infra_count}")
-        with infra_cols[1]:
-            new_infra_count = st.number_input(
-                "Infra Count",
-                min_value=0,
-                max_value=3,
-                value=st.session_state.infra_count,
-                key="infra_count_input"
+    # 動態生成 Infra IP 輸入框
+    for i in range(1, st.session_state.infra_count + 1):
+        ip_key = f"INFRA{i:02d}_IP"
+        state_key = f"ip_{ip_key}"
+        
+        if state_key not in st.session_state:
+            st.session_state[state_key] = config['install_env'].get(ip_key, "")
+        
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            ip_value = st.text_input(
+                f"INFRA {i:02d} IP",
+                value=st.session_state[state_key],
+                key=f"input_{ip_key}"
             )
-            if new_infra_count != st.session_state.infra_count:
-                st.session_state.infra_count = new_infra_count
-                st.rerun()
+        with col2:
+            if ip_value and not is_valid_ipv4(ip_value):
+                st.error("❌ Invalid IP")
+        
+        st.session_state[state_key] = ip_value
+        config['install_env'][ip_key] = ip_value
 
-        # 動態生成 Infra IP 輸入框
-        for i in range(1, st.session_state.infra_count + 1):
-            ip_key = f"INFRA{i:02d}_IP"
-            if ip_key not in config['install_env']:
-                config['install_env'][ip_key] = ""
-            config['install_env'][ip_key] = st.text_input(f"Infra {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"infra_{i}_ip")
+    # ===== Worker Node Count (在 form 外部) =====
+    st.markdown("#### Worker Nodes")
+    worker_cols = st.columns([3, 1])
+    with worker_cols[0]:
+        st.write(f"Current Worker Count: {st.session_state.worker_count}")
+    with worker_cols[1]:
+        new_worker_count = st.number_input(
+            "Worker Count",
+            min_value=0,
+            max_value=9,
+            value=st.session_state.worker_count,
+            key="worker_count_input"
+        )
+        if new_worker_count != st.session_state.worker_count:
+            old_count = st.session_state.worker_count
+            st.session_state.worker_count = new_worker_count
+            
+            for i in range(new_worker_count + 1, old_count + 1):
+                ip_key = f"WORKER{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key in st.session_state:
+                    del st.session_state[state_key]
+                if ip_key in config['install_env']:
+                    del config['install_env'][ip_key]
+            
+            for i in range(old_count + 1, new_worker_count + 1):
+                ip_key = f"WORKER{i:02d}_IP"
+                state_key = f"ip_{ip_key}"
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = ""
+            
+            config_manager.save_config(config)
+            st.rerun()
 
-        # Worker Node 配置
-        st.markdown("#### Worker Nodes")
-        worker_cols = st.columns([3, 1])
-        with worker_cols[0]:
-            st.write(f"Current Worker Count: {st.session_state.worker_count}")
-        with worker_cols[1]:
-            new_worker_count = st.number_input(
-                "Worker Count",
-                min_value=0,
-                max_value=9,
-                value=st.session_state.worker_count,
-                key="worker_count_input"
+    # 動態生成 Worker IP 輸入框
+    for i in range(1, st.session_state.worker_count + 1):
+        ip_key = f"WORKER{i:02d}_IP"
+        state_key = f"ip_{ip_key}"
+        
+        if state_key not in st.session_state:
+            st.session_state[state_key] = config['install_env'].get(ip_key, "")
+        
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            ip_value = st.text_input(
+                f"Worker {i:02d} IP",
+                value=st.session_state[state_key],
+                key=f"input_{ip_key}"
             )
-            if new_worker_count != st.session_state.worker_count:
-                st.session_state.worker_count = new_worker_count
-                st.rerun()
+        with col2:
+            if ip_value and not is_valid_ipv4(ip_value):
+                st.error("❌ Invalid IP")
+        
+        st.session_state[state_key] = ip_value
+        config['install_env'][ip_key] = ip_value
 
-        # 動態生成 Worker IP 輸入框
-        for i in range(1, st.session_state.worker_count + 1):
-            ip_key = f"WORKER{i:02d}_IP"
-            if ip_key not in config['install_env']:
-                config['install_env'][ip_key] = ""
-            config['install_env'][ip_key] = st.text_input(f"Worker {i:02d} IP", value=config['install_env'].get(ip_key, ""), key=f"worker_{i}_ip")
-
-        # Bastion 和 Bootstrap IP
-        st.markdown("#### Other IPs")
+    # ===== 將提交部分包在 form 內 =====
+    st.divider()
+    with st.form("cluster_config_form"):
+        st.subheader("Other IPs")
         col_bast, col_boot = st.columns(2)
         with col_bast:
-            config['install_env']['BASTION_IP'] = st.text_input("Bastion IP", value=config['install_env']['BASTION_IP'])
+            bastion_ip = st.text_input(
+                "Bastion IP", 
+                value=config['install_env'].get('BASTION_IP', ''),
+                key="bastion_ip_input"
+            )
+            if bastion_ip and not is_valid_ipv4(bastion_ip):
+                st.error("❌ Invalid IP")
+            config['install_env']['BASTION_IP'] = bastion_ip
         with col_boot:
-            config['install_env']['BOOTSTRAP_IP'] = st.text_input("Bootstrap IP", value=config['install_env']['BOOTSTRAP_IP'])
-            
-        st.divider()
+            bootstrap_ip = st.text_input(
+                "Bootstrap IP (optional)", 
+                value=config['install_env'].get('BOOTSTRAP_IP', ''),
+                key="bootstrap_ip_input"
+            )
+            if bootstrap_ip and not is_valid_ipv4(bootstrap_ip):
+                st.error("❌ Invalid IP")
+            config['install_env']['BOOTSTRAP_IP'] = bootstrap_ip
+
+        st.subheader("Network Configuration")
+        col1, col2 = st.columns(2)
+        with col1:
+            config['install_env']['MACHINE_NETWORK_CIDR'] = st.text_input(
+                "Machine Network CIDR (optional, auto-generated from Bastion IP if empty)",
+                value=config['install_env']['MACHINE_NETWORK_CIDR'],
+                help="Leave empty to auto-generate from Bastion IP",
+                key="machine_cidr_input"
+            )
+            config['install_env']['CLUSTER_NETWORK_CIDR'] = st.text_input(
+                "Cluster Network CIDR",
+                value=config['install_env']['CLUSTER_NETWORK_CIDR'],
+                key="cluster_cidr_input"
+            )
+        with col2:
+            config['install_env']['CLUSTER_NETWORK_HOST_PREFIX'] = st.number_input(
+                "Host Prefix",
+                min_value=1,
+                max_value=32,
+                value=int(config['install_env'].get('CLUSTER_NETWORK_HOST_PREFIX', '23')),
+                key="host_prefix_input"
+            )
+            config['install_env']['SERVICE_NETWORK_CIDR'] = st.text_input(
+                "Service Network CIDR",
+                value=config['install_env']['SERVICE_NETWORK_CIDR'],
+                key="service_cidr_input"
+            )
+        
+        config['install_env']['NETWORK_TYPE'] = st.selectbox(
+            "Network Type",
+            ["OVNKubernetes", "OpenShiftSDN"],
+            index=0 if config['install_env']['NETWORK_TYPE'] == 'OVNKubernetes' else 1,
+            key="network_type_input"
+        )
+
         st.subheader("Credentials & Keys")
-        config['install_env']['REGISTRY_PASSWORD'] = st.text_input("Registry Password", value=config['install_env']['REGISTRY_PASSWORD'], type="password")
+        config['install_env']['REGISTRY_PASSWORD'] = st.text_input(
+            "Registry Password", 
+            value=config['install_env']['REGISTRY_PASSWORD'], 
+            type="password", 
+            key="registry_pwd_input"
+        )
         
         col1, col2 = st.columns(2)
         with col1:
-            # 支援輸入路徑或直接貼內容
-            ssh_input = st.text_area("SSH Public Key", value=config['install_env']['SSH_KEY'], height=100, help="貼上 id_rsa.pub 內容或填寫路徑")
-            # 簡單判斷：如果包含換行或 SSH 標頭則是內容，否則嘗試讀取文件
+            ssh_input = st.text_area(
+                "SSH Public Key", 
+                value=config['install_env']['SSH_KEY'], 
+                height=100, 
+                help="貼上 id_rsa.pub 內容或填寫路徑", 
+                key="ssh_key_input"
+            )
             if "ssh-" in ssh_input or "\n" in ssh_input:
                 config['install_env']['SSH_KEY'] = ssh_input
             elif os.path.exists(ssh_input):
                 with open(ssh_input, 'r') as f:
                     config['install_env']['SSH_KEY'] = f.read().strip()
             else:
-                config['install_env']['SSH_KEY'] = ssh_input # 暫時存著，驗證時再檢查
+                config['install_env']['SSH_KEY'] = ssh_input
 
         with col2:
-            trust_input = st.text_area("Additional Trust Bundle (CA Cert)", value=config['install_env']['ADDITIONAL_TRUST_BUNDLE'], height=150, help="貼上 CA Certificate 內容")
+            trust_input = st.text_area(
+                "Additional Trust Bundle (CA Cert)", 
+                value=config['install_env']['ADDITIONAL_TRUST_BUNDLE'], 
+                height=150, 
+                help="貼上 CA Certificate 內容", 
+                key="trust_bundle_input"
+            )
             if "BEGIN CERTIFICATE" in trust_input or os.path.exists(trust_input):
-                 if os.path.exists(trust_input):
+                if os.path.exists(trust_input):
                     with open(trust_input, 'r') as f:
                         config['install_env']['ADDITIONAL_TRUST_BUNDLE'] = f.read()
-                 else:
+                else:
                     config['install_env']['ADDITIONAL_TRUST_BUNDLE'] = trust_input
             else:
                 config['install_env']['ADDITIONAL_TRUST_BUNDLE'] = trust_input
 
-        submitted = st.form_submit_button("Save & Generate install-config.yaml")
+        submitted = st.form_submit_button("💾 Save & Generate install-config.yaml")
         
         if submitted:
             # 驗證必填
             if not config['install_env']['CLUSTER_DOMAIN'] or not config['install_env']['BASE_DOMAIN']:
                 st.error("Cluster Name 和 Base Domain 不能為空")
-            elif not config['install_env']['SSH_KEY'] or not config['install_env']['ADDITIONAL_TRUST_BUNDLE']:
-                st.error("SSH Key 和 Trust Bundle 不能為空")
+            elif not config['install_env'].get('SSH_KEY'):
+                st.error("SSH Key 不能為空")
+            elif not config['install_env'].get('REGISTRY_PASSWORD'):
+                st.error("Registry Password 不能為空")
             else:
                 try:
+                    # 同步所有 node IP (確保 form 外的值被保存)
+                    for i in range(1, st.session_state.master_count + 1):
+                        ip_key = f"MASTER{i:02d}_IP"
+                        config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                    
+                    for i in range(1, st.session_state.infra_count + 1):
+                        ip_key = f"INFRA{i:02d}_IP"
+                        config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                    
+                    for i in range(1, st.session_state.worker_count + 1):
+                        ip_key = f"WORKER{i:02d}_IP"
+                        config['install_env'][ip_key] = st.session_state.get(f"ip_{ip_key}", "")
+                    
                     config_manager.save_config(config)
                     
                     # 生成 YAML
@@ -279,14 +533,14 @@ def show_cluster_config_page():
                     generator = YAMLGenerator(config, CURRENT_DIR)
                     yaml_content = generator.generate_install_config()
                     
-                    output_path = os.path.join(CURRENT_DIR, "install/ocp", "install-config.yaml")
+                    output_path = os.path.join(CURRENT_DIR, "install/ocp/install-config.yaml")
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     
                     with open(output_path, 'w') as f:
                         f.write(yaml_content)
                     
                     st.session_state.cluster_configured = True
-                    st.success(f"✅ Configuration saved & `install-config.yaml` generated!<br>Path: `{output_path}`", unsafe_allow_html=True)
+                    st.success(f"✅ Configuration saved & `install-config.yaml` generated!")
                     
                     with st.expander("Preview install-config.yaml"):
                         st.code(yaml_content, language="yaml")

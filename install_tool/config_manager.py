@@ -21,24 +21,23 @@ class ConfigManager:
             }
         elif 'cluster' in self.config_file:
             default_config = {
+                "version_info": {
+                    "OCP_VERSION": "4.20"
+                },
                 "install_env": {
                     "INSTALL_MODE": "standard",
-                    "CLUSTER_DOMAIN": "",
-                    "BASE_DOMAIN": "",
+                    "CLUSTER_DOMAIN": "ocp4",
+                    "BASE_DOMAIN": "example.com",
                     "BASTION_IP": "",
                     "BOOTSTRAP_IP": "",
-                    "MASTER01_IP": "",
-                    "MASTER02_IP": "",
-                    "MASTER03_IP": "",
-                    "INFRA01_IP": "",
-                    "INFRA02_IP": "",
-                    "INFRA03_IP": "",
-                    "WORKER01_IP": "",
-                    "WORKER02_IP": "",
-                    "WORKER03_IP": "",
                     "REGISTRY_PASSWORD": "P@ssw0rd",
                     "SSH_KEY": "",
-                    "ADDITIONAL_TRUST_BUNDLE": ""
+                    "ADDITIONAL_TRUST_BUNDLE": "",
+                    "MACHINE_NETWORK_CIDR": "",
+                    "CLUSTER_NETWORK_CIDR": "10.128.0.0/14",
+                    "CLUSTER_NETWORK_HOST_PREFIX": 23,
+                    "SERVICE_NETWORK_CIDR": "172.30.0.0/16",
+                "NETWORK_TYPE": "OVNKubernetes"
                 }
             }
         else:

@@ -1,68 +1,260 @@
 import json
 import os
 import yaml
+import re
 import base64
+
+class LiteralString(str):
+    """用於標記需要在 YAML 中使用 | 的字串"""
+    pass
+
+class QuotedString(str):
+    """用於標記需要在 YAML 中使用引號的字串"""
+    pass
 
 class YAMLGenerator:
     def __init__(self, config, current_dir):
         self.config = config
         self.current_dir = current_dir
         self.v_info = config.get('version_info', {})
-        # 兼容舊版結構或新版分離結構
         self.csi_info = config.get('csi_info', {}) 
         self.env = config.get('install_env', {})
 
+    @staticmethod
+    def is_valid_ipv4(ip):
+        """驗證 IPv4 格式"""
+        if not ip:
+            return False
+        pattern = r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$'
+        match = re.match(pattern, ip)
+        if not match:
+            return False
+        # 檢查每個數字是否在 0-255 範圍內
+        for group in match.groups():
+            if int(group) > 255:
+                return False
+        return True
+
+    def validate_ips(self):
+        """驗證所有 IP 欄位"""
+        ip_fields = []
+        
+        # Master IPs
+        for i in range(1, 4):
+            key = f"MASTER{i:02d}_IP"
+            if key in self.env and self.env[key]:
+                ip_fields.append((key, self.env[key]))
+        
+        # Infra IPs
+        for i in range(1, 4):
+            key = f"INFRA{i:02d}_IP"
+            if key in self.env and self.env[key]:
+                ip_fields.append((key, self.env[key]))
+        
+        # Worker IPs
+        for i in range(1, 10):
+            key = f"WORKER{i:02d}_IP"
+            if key in self.env and self.env[key]:
+                ip_fields.append((key, self.env[key]))
+        
+        # Bastion IP
+        if 'BASTION_IP' in self.env:
+            ip_fields.append(('BASTION_IP', self.env['BASTION_IP']))
+        
+        # Bootstrap IP
+        if 'BOOTSTRAP_IP' in self.env and self.env['BOOTSTRAP_IP']:
+            ip_fields.append(('BOOTSTRAP_IP', self.env['BOOTSTRAP_IP']))
+        
+        invalid_ips = []
+        for field_name, ip in ip_fields:
+            if not self.is_valid_ipv4(ip):
+                invalid_ips.append(f"{field_name}: {ip}")
+        
+        return invalid_ips
+
+    def get_ocp_version_path(self):
+        """從 OCP_RELEASE 提取版本號用於 image path"""
+        ocp_release = self.v_info.get('OCP_RELEASE', '4.20.8')
+        # 提取主版本和次版本，例如 4.20.8 -> 4.20
+        match = re.match(r'(\d+)\.(\d+)', ocp_release)
+        if match:
+            major = match.group(1)
+            minor = match.group(2)
+            return f"ocp{major}{minor}"
+        return "ocp420"  # 預設值
+
+    def get_registry_fqdn(self):
+        """生成 registry 的 FQDN"""
+        cluster_name = self.env.get('CLUSTER_DOMAIN', 'ocp4')
+        base_domain = self.env.get('BASE_DOMAIN', 'example.com')
+        
+        # 如果 CLUSTER_DOMAIN 已經包含完整域名，就使用它
+        if '.' in cluster_name:
+            hostname = cluster_name
+        else:
+            hostname = f"{cluster_name}.{base_domain}"
+        
+        return f"bastion.{hostname}"
+
     def generate_install_config(self):
-        registry_auth = f"init:{self.env['REGISTRY_PASSWORD']}"
+        # 驗證 IP 格式
+        invalid_ips = self.validate_ips()
+        if invalid_ips:
+            raise ValueError(f"Invalid IPv4 addresses found:\n" + "\n".join(invalid_ips))
+        
+        # 生成 Registry URL (需求1)
+        registry_fqdn = self.get_registry_fqdn()
+        registry_url = f"{registry_fqdn}:8443"
+
+        registry_password = self.env.get('REGISTRY_PASSWORD', '')
+        registry_auth = f"init:{registry_password}"
         auth_b64 = base64.b64encode(registry_auth.encode()).decode()
-        registry_url = f"{self.env['BASTION_IP']}:8443"
         
         pull_secret_obj = {
-            "auths": { f"{registry_url}": {"auth": auth_b64} }
+            "auths": {
+                registry_url: {"auth": auth_b64}
+            }
         }
 
-        cluster_name = self.env['CLUSTER_DOMAIN'].split('.')[0] if '.' in self.env['CLUSTER_DOMAIN'] else self.env['CLUSTER_DOMAIN']
-        if not cluster_name: cluster_name = "ocp4"
+        # 提取 cluster name
+        cluster_domain = self.env.get('CLUSTER_DOMAIN', 'ocp4')
+        if '.' in cluster_domain:
+            cluster_name = cluster_domain.split('.')[0]
+            if not cluster_name:
+                cluster_name = "ocp4"
+        else:
+            cluster_name = cluster_domain
+        if not cluster_name:
+            cluster_name = "ocp4"
+
+        master_count = sum(1 for k in self.env if k.startswith('MASTER') and k.endswith('_IP') and self.env[k])
+        worker_count = sum(1 for k in self.env if k.startswith('WORKER') and k.endswith('_IP') and self.env[k])
+
+        if master_count == 0:
+            master_count = 3  # 預設值
 
         config_map = {
             "apiVersion": "v1",
-            "baseDomain": self.env['BASE_DOMAIN'],
-            "metadata": { "name": cluster_name },
-            "networking": {
-                "machineNetwork": [{"cidr": ".".join(self.env['BASTION_IP'].split('.')[:3]) + ".0/24"}],
-                "clusterNetwork": [{"cidr": "10.128.0.0/14", "hostPrefix": 23}],
-                "serviceNetwork": ["172.30.0.0/16"],
-                "networkType": "OVNKubernetes"
-            },
+            "baseDomain": self.env.get('BASE_DOMAIN', ''),
+            "metadata": {"name": cluster_name},
+            "networking": {},
             "platform": {"none": {}},
             "fips": False,
             "pullSecret": json.dumps(pull_secret_obj),
-            "sshKey": self.env['SSH_KEY'],
-            "additionalTrustBundle": self.env['ADDITIONAL_TRUST_BUNDLE'],
+            "sshKey": self.env.get('SSH_KEY', ''),  # 需求2: 字串處理在 YAML dump 時處理
+            "additionalTrustBundle": self.env.get('ADDITIONAL_TRUST_BUNDLE', ''),
             "imageDigestSources": [
-                {"mirrors": [f"{registry_url}/ocp420/openshift/release"], "source": "quay.io/openshift-release-dev/ocp-v4.0-art-dev"},
-                {"mirrors": [f"{registry_url}/ocp420/openshift/release-images"], "source": "quay.io/openshift-release-dev/ocp-release"}
+                {
+                    "mirrors": [f"{registry_url}/{self.get_ocp_version_path()}/openshift/release"],
+                    "source": "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
+                },
+                {
+                    "mirrors": [f"{registry_url}/{self.get_ocp_version_path()}/openshift/release-images"],
+                    "source": "quay.io/openshift-release-dev/ocp-release"
+                }
             ]
         }
 
-        mode = self.env['INSTALL_MODE']
-        if mode == "compact":
-            config_map["controlPlane"] = {"architecture": self.v_info.get('ARCHITECTURE', 'amd64'), "hyperthreading": "Enabled", "name": "master", "replicas": 3}
-            config_map["compute"] = [{"architecture": self.v_info.get('ARCHITECTURE', 'amd64'), "hyperthreading": "Enabled", "name": "worker", "replicas": 0}]
-        elif mode == "sno":
-            config_map["controlPlane"] = {"architecture": self.v_info.get('ARCHITECTURE', 'amd64'), "hyperthreading": "Enabled", "name": "master", "replicas": 1}
-            config_map["compute"] = []
-        else:
-            config_map["controlPlane"] = {"architecture": self.v_info.get('ARCHITECTURE', 'amd64'), "hyperthreading": "Enabled", "name": "master", "replicas": 3}
-            config_map["compute"] = [{"architecture": self.v_info.get('ARCHITECTURE', 'amd64'), "hyperthreading": "Enabled", "name": "worker", "replicas": 3}]
+        # 需求4: Networking 配置
+        networking = {}
 
+        # machineNetwork (可選，若沒有輸入則不產生)
+        machine_cidr = self.env.get('MACHINE_NETWORK_CIDR', '').strip()
+        
+        # 只有當 machine_cidr 不為空時才添加到 networking
+        if machine_cidr:
+            networking["machineNetwork"] = [{"cidr": machine_cidr}]
+        
+        # clusterNetwork (預設 10.128.0.0/14)
+        cluster_cidr = self.env.get('CLUSTER_NETWORK_CIDR', '10.128.0.0/14')
+        host_prefix = int(self.env.get('CLUSTER_NETWORK_HOST_PREFIX', 23))
+        networking["clusterNetwork"] = [{"cidr": cluster_cidr, "hostPrefix": host_prefix}]
+        
+        # serviceNetwork (預設 172.30.0.0/16)
+        service_cidr = self.env.get('SERVICE_NETWORK_CIDR', '172.30.0.0/16')
+        networking["serviceNetwork"] = [service_cidr]
+        
+        networking["networkType"] = self.env.get('NETWORK_TYPE', 'OVNKubernetes')
+        config_map["networking"] = networking
+
+        install_mode = self.env.get('INSTALL_MODE', 'standard')
+        architecture = self.v_info.get('ARCHITECTURE', 'amd64')
+        
+        if install_mode == "sno":
+            config_map["controlPlane"] = {
+                "architecture": architecture,
+                "hyperthreading": "Enabled",
+                "name": "master",
+                "replicas": 1
+            }
+            config_map["compute"] = []
+        elif install_mode == "compact":
+            config_map["controlPlane"] = {
+                "architecture": architecture,
+                "hyperthreading": "Enabled",
+                "name": "master",
+                "replicas": master_count
+            }
+            config_map["compute"] = [{
+                "architecture": architecture,
+                "hyperthreading": "Enabled",
+                "name": "worker",
+                "replicas": 0
+            }]
+        else:  # standard
+            config_map["controlPlane"] = {
+                "architecture": architecture,
+                "hyperthreading": "Enabled",
+                "name": "master",
+                "replicas": master_count
+            }
+            if worker_count > 0:
+                config_map["compute"] = [{
+                    "architecture": architecture,
+                    "hyperthreading": "Enabled",
+                    "name": "worker",
+                    "replicas": worker_count
+                }]
+            else:
+                config_map["compute"] = [{
+                    "architecture": architecture,
+                    "hyperthreading": "Enabled",
+                    "name": "worker",
+                    "replicas": 0
+                }]
+
+        return self._dump_yaml(config_map)
+
+    def _dump_yaml(self, config_map):
+        """自定義 YAML dump，處理特殊格式需求"""
+        # additionalTrustBundle 且包含換行，替換為 LiteralString
+        if 'additionalTrustBundle' in config_map:
+            trust_bundle = config_map['additionalTrustBundle']
+            if trust_bundle and '\n' in trust_bundle:
+                config_map['additionalTrustBundle'] = LiteralString(trust_bundle)
+    
+        # SSH Key 使用單引號
+        if 'sshKey' in config_map:
+            config_map['sshKey'] = QuotedString(config_map['sshKey'])
+    
+        # 定義 representer
+        def literal_str_representer(dumper, data):
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+    
+        def quoted_str_representer(dumper, data):
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style="'")
+        
         def str_representer(dumper, data):
-            if len(data.splitlines()) > 1:
+            if '\n' in data:
                 return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
             return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+        
+        # 註冊 representer
+        yaml.add_representer(LiteralString, literal_str_representer)
+        yaml.add_representer(QuotedString, quoted_str_representer)
         yaml.add_representer(str, str_representer)
         
-        return yaml.dump(config_map, sort_keys=False, allow_unicode=True)
+        return yaml.dump(config_map, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
     def generate_imageset_config(self):
         operators_file = os.path.join(self.current_dir, 'operators.json')

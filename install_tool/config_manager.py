@@ -2,13 +2,18 @@ import json
 import os
 
 class ConfigManager:
-    def __init__(self, config_file='tool_config.json'):
-        self.config_file = config_file
+    def __init__(self, config_file='tool_config.json', config_dir=None):
+        if config_dir is None:
+            config_dir = os.path.join(os.getcwd(), 'config')
+        self.config_dir = config_dir
+        self.config_file = os.path.join(config_dir, os.path.basename(config_file))
+
+        os.makedirs(self.config_dir, exist_ok=True)
+
         if not os.path.exists(self.config_file):
             self.create_default_config()
         
     def create_default_config(self):
-        # 根據文件名決定默認內容
         if 'tool' in self.config_file:
             default_config = {
                 "version_info": {

@@ -7,21 +7,43 @@ from datetime import datetime
 class OperatorTools:
     def __init__(self):
         self.current_dir = os.getcwd()
-        self.catalog_file = os.path.join(self.current_dir, "operator_catalog.json")
+        self.config_dir = os.path.join(self.current_dir, 'config')
+        os.makedirs(self.config_dir, exist_ok=True)
+
+        self.catalog_file = os.path.join(self.config_dir, "operator_catalog.json")
+        self.authfile = os.path.join(os.path.expanduser("~"), ".docker", "config.json")
         
         # 尋找 oc-mirror（僅用於獲取詳細資訊）
         self.oc_mirror_cmd = self._find_oc_mirror()
     
     def _find_oc_mirror(self):
-        # 僅在 ~/.local/bin 尋找 oc-mirror
-        home_dir = os.path.expanduser("~")
-        local_bin = os.path.join(home_dir, ".local/bin/oc-mirror")
+        """尋找 oc-mirror 命令，返回路徑或 None"""
+        # 優先使用 ~/.local/bin
+        local_bin = os.path.join(os.path.expanduser("~"), ".local/bin/oc-mirror")
         if os.path.exists(local_bin):
-            self.oc_mirror_cmd = local_bin
-        else:
-            self.oc_mirror_cmd = "oc-mirror"
+            return local_bin
         
-        self.authfile = os.path.join(os.path.expanduser("~"), ".docker", "config.json")
+        # 然後是當前工作目錄
+        current_bin = os.path.join(self.current_dir, "usr/bin/oc-mirror")
+        if os.path.exists(current_bin):
+            return current_bin
+        
+        # 最後嘗試系統 PATH
+        import shutil
+        if shutil.which('oc-mirror'):
+            return 'oc-mirror'
+        
+        return None
+
+    def get_ocp_version(self):
+        """從 tool_config.json 或 operator_catalog.json 獲取 OCP 版本"""
+        # 先嘗試從 operator_catalog.json 獲取
+        catalog_data = self._load_catalog_data()
+        if catalog_data and 'ocp_version' in catalog_data:
+            return catalog_data['ocp_version']
+        
+        # 再嘗試從 tool_config.json 獲取
+        return self._get_ocp_version_from_config()
 
     def _load_catalog_data(self):
         """從快取檔案載入 catalog 資料"""
@@ -73,9 +95,12 @@ class OperatorTools:
             
             for pkg in packages:
                 if pkg['name'] == package:
+                    default_channel = pkg.get('default_channel', 'stable')
+                    # 如果快取中只有 default_channel 而沒有詳細 channels，
+                    # 返回 default_channel 作為唯一選項
                     return {
-                        'default_channel': pkg.get('default_channel', 'stable'),
-                        'channels': []  # 詳細 channel 需要即時查詢
+                        'default_channel': default_channel,
+                        'channels': [{'name': default_channel}]  # 使用 default_channel 作為可用 channel
                     }
         
         # 如果快取中沒有，使用 oc-mirror 查詢
@@ -90,35 +115,27 @@ class OperatorTools:
     def _get_ocp_version_from_config(self):
         """從 tool_config.json 獲取 OCP 版本"""
         try:
-            config_path = os.path.join(self.current_dir, 'tool_config.json')
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                    ocp_release = config.get('version_info', {}).get('OCP_RELEASE', '4.20')
-                    match = re.match(r'(\d+\.\d+)', ocp_release)
-                    if match:
-                        return match.group(1)
+            # 嘗試多個可能的路徑
+            possible_paths = [
+                os.path.join(self.config_dir, 'tool_config.json'),
+                os.path.join(os.getcwd(), 'tool_config.json')
+            ]
+
+            for config_path in possible_paths:
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                        ocp_release = config.get('version_info', {}).get('OCP_RELEASE', '4.20')
+                        match = re.match(r'(\d+\.\d+)', ocp_release)
+                        if match:
+                            return match.group(1)
+                        break
+
             return '4.20'
-        except Exception:
-            return '4.20'
-    
-    def _fetch_package_channels_online(self, catalog, package):
-        """在線查詢 package channels"""
-        if not self.oc_mirror_cmd:
-            return {'default_channel': 'stable', 'channels': []}
-        
-        try:
-            cmd = [self.oc_mirror_cmd, 'list', 'operators', '--catalog', catalog, '--package', package]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode == 0:
-                return self._parse_channels_output(result.stdout, package)
-            
         except Exception as e:
-            print(f"Error fetching channels: {e}")
-        
-        return {'default_channel': 'stable', 'channels': []}
-    
+            print(f"Error reading OCP version: {e}")
+            return '4.20'    
+
     def _fetch_channel_versions_online(self, catalog, package, channel):
         """在線查詢 channel 版本"""
         if not self.oc_mirror_cmd:
@@ -127,7 +144,7 @@ class OperatorTools:
         try:
             cmd = [self.oc_mirror_cmd, 'list', 'operators', '--catalog', catalog, 
                    '--package', package, '--channel', channel]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             
             if result.returncode == 0:
                 versions = re.findall(r'v?(\d+\.\d+\.\d+)', result.stdout)

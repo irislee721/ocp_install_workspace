@@ -16,6 +16,8 @@ class YAMLGenerator:
     def __init__(self, config, current_dir):
         self.config = config
         self.current_dir = current_dir
+        self.config_dir = os.path.join(self.current_dir, 'config')
+        os.makedirs(self.config_dir, exist_ok=True)
         self.v_info = config.get('version_info', {})
         self.csi_info = config.get('csi_info', {}) 
         self.env = config.get('install_env', {})
@@ -257,48 +259,57 @@ class YAMLGenerator:
         return yaml.dump(config_map, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
     def generate_imageset_config(self):
-        operators_file = os.path.join(self.current_dir, 'operators.json')
+        """
+        生成 imageset-config.yaml
+        從 operators.json 和 cluster_config.json 獲取資訊
+        """
+        # 讀取 operators.json
+        operators_file = os.path.join(self.config_dir, 'operators.json')
         operators_list = []
         if os.path.exists(operators_file):
             with open(operators_file, 'r') as f:
                 operators_list = json.load(f)
         
+        # 讀取 additional_images.json
+        additional_images_file = os.path.join(self.config_dir, 'additional_images.json')
+        additional_images = []
+        if os.path.exists(additional_images_file):
+            with open(additional_images_file, 'r') as f:
+                additional_images = json.load(f)
+        else:
+            # 從 default_images.json 載入預設值
+            json_path = os.path.join(self.config_dir, "default_images.json")
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as f:
+                    data = json.load(f)
+                    additional_images = data.get('base_images', [])
+        
+        # 合併 CSI images
+        csi_images = self._get_csi_images()
+        for csi_img in csi_images:
+            if csi_img not in additional_images:
+                additional_images.append(csi_img)        
+        
+        # 構建 operators 區塊
         op_blocks = []
         if operators_list:
-            # 假設單一 Catalog，實際可擴展
-            catalog = "registry.redhat.io/redhat/redhat-operator-index:v4.20"
+            # 從 operator_catalog.json 獲取 catalog URL
+            catalog = f"registry.redhat.io/redhat/redhat-operator-index:v{self.v_info.get('OCP_RELEASE', '4.20').rsplit('.', 1)[0]}"
             packages = []
             for op in operators_list:
                 packages.append({
                     "name": op['name'],
-                    "channels": [{"name": op.get('channel', 'stable'), "minVersion": op['minVersion'], "maxVersion": op['maxVersion']}]
+                    "channels": [{
+                        "name": op.get('channel', 'stable'),
+                        "minVersion": op.get('minVersion', ''),
+                        "maxVersion": op.get('maxVersion', '')
+                    }]
                 })
             op_blocks.append({"catalog": catalog, "packages": packages})
-
-        # CSI Images
-        additional_images = [
-            {"name": "registry.redhat.io/ubi8/ubi:latest"},
-            {"name": "registry.redhat.io/ubi9/ubi:latest"}
-        ]
         
-        csi_type = self.csi_info.get('CSI_TYPE', 'nfs-csi')
-        
-        if csi_type == 'nfs-csi':
-            additional_images.extend([
-                {"name": "registry.k8s.io/sig-storage/csi-resizer:v1.14.0"},
-                {"name": "registry.k8s.io/sig-storage/csi-provisioner:v5.3.0"},
-                {"name": "registry.k8s.io/sig-storage/nfsplugin:v4.12.1"}
-            ])
-        elif csi_type == 'trident':
-            ver = self.csi_info.get('TRIDENT_INSTALLER', '25.02.1')
-            additional_images.extend([
-                {"name": f"docker.io/netapp/trident:{ver}"},
-                {"name": f"docker.io/netapp/trident-operator:{ver}"},
-                {"name": "registry.k8s.io/sig-storage/csi-provisioner:v5.2.0"}
-            ])
-        # 其他 CSI 類型可在此擴展
-
-        ocp_major_minor = self.v_info.get('OCP_RELEASE', '4.20').rsplit('.', 1)[0]
+        # OCP 版本資訊
+        ocp_release = self.v_info.get('OCP_RELEASE', '4.20.8')
+        ocp_major_minor = ocp_release.rsplit('.', 1)[0]  # 4.20.8 -> 4.20
         
         config_map = {
             "apiVersion": "mirror.openshift.io/v2alpha1",
@@ -306,14 +317,18 @@ class YAMLGenerator:
             "archiveSize": 5,
             "mirror": {
                 "platform": {
-                    "channels": [{"name": f"stable-{ocp_major_minor}", "minVersion": self.v_info.get('OCP_RELEASE'), "maxVersion": self.v_info.get('OCP_RELEASE')}],
+                    "channels": [{
+                        "name": f"stable-{ocp_major_minor}",
+                        "minVersion": ocp_release,
+                        "maxVersion": ocp_release
+                    }],
                     "graph": True
                 },
                 "operators": op_blocks,
                 "additionalImages": additional_images
             }
         }
-
+        
         return yaml.dump(config_map, sort_keys=False, allow_unicode=True)
     
     def generate_agent_config(self):
@@ -487,3 +502,35 @@ class YAMLGenerator:
                 "deviceName": device
             }
         }
+    
+    def _get_csi_images(self):
+        """
+        從 default_images.json 獲取 CSI 相關的 additional images
+        """
+        json_path = os.path.join(self.config_dir, "default_images.json")
+        
+        if not os.path.exists(json_path):
+            return []
+        
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        
+        csi_type = self.csi_info.get('CSI_TYPE', 'none')
+        csi_images_data = data.get('csi_images', {})
+        
+        if csi_type == 'trident':
+            trident_ver = self.csi_info.get('TRIDENT_INSTALLER', '25.02.1')
+            trident_major_minor = trident_ver.rsplit('.', 1)[0] if '.' in trident_ver else trident_ver
+            
+            images = []
+            for img in csi_images_data.get('trident', []):
+                img_name = img['name']
+                img_name = img_name.replace('25.02.1', trident_ver)
+                img_name = img_name.replace('25.02', trident_major_minor)
+                images.append({"name": img_name})
+            return images
+        else:
+            return csi_images_data.get(csi_type, [])

@@ -3,10 +3,10 @@
 ## install_tool
 
 ### Architecture
+![alt text](<image/ocp install python app architecture.png>)
 
 ### How to start
 1. install streamlit package
-![alt text](<image/ocp install python app architecture.png>)
 
 2. execute python
 ```bash

@@ -55,7 +55,7 @@ class RegistryManager:
             return False, container_name, port
         
         # 等待服務就緒
-        time.sleep(5)
+        time.sleep(20)
         
         return True, container_name, port
     
@@ -106,24 +106,52 @@ class RegistryManager:
             status_callback(f"🧹 清理舊容器...")
         subprocess.run([container_cmd, 'stop', container_name], capture_output=True, timeout=30)
         subprocess.run([container_cmd, 'rm', container_name], capture_output=True, timeout=30)
-    
+ 
     def _start_container(self, container_cmd, container_name, port, authfile, catalog_image, status_callback=None):
         """啟動容器"""
         if status_callback:
             status_callback(f"📦 啟動 Operator Registry 容器...")
         
-        result = subprocess.run(
-            [container_cmd, 'run', '-d', '--rm', '--name', container_name,
-             '-p', f'{port}:{port}',
-             '--authfile', authfile,
-             catalog_image],
-            capture_output=True, text=True, timeout=60
-        )
+        # 構建命令 - 添加 SELinux 處理
+        cmd = [
+            container_cmd, 'run', '-d', '--rm',
+            '--name', container_name,
+            '-p', f'{port}:{port}',
+            '--security-opt', 'label=disable',  # 關鍵修復
+        ]
+        
+        # 可選的 authfile
+        if authfile and os.path.exists(authfile):
+            cmd.extend(['--authfile', authfile])
+        
+        cmd.append(catalog_image)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         
         if result.returncode != 0:
+            if status_callback:
+                status_callback(f"❌ 啟動失敗: {result.stderr[:200]}")
             return False
         
         if status_callback:
             status_callback(f"✅ 容器已啟動，等待服務就緒...")
+        
+        # 增加等待時間
+        time.sleep(15)
+        
+        # 驗證容器是否仍在運行
+        check = subprocess.run(
+            [container_cmd, 'ps', '--filter', f'name={container_name}', '--format', '{{.Status}}'],
+            capture_output=True, text=True, timeout=10
+        )
+        
+        if 'Up' not in check.stdout:
+            logs = subprocess.run(
+                [container_cmd, 'logs', container_name],
+                capture_output=True, text=True, timeout=10
+            )
+            if status_callback:
+                status_callback(f"❌ 容器已停止: {logs.stdout[-200:]}")
+            return False
         
         return True

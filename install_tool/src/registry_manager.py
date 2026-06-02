@@ -63,14 +63,14 @@ class RegistryManager:
         """停止 Operator Registry 容器"""
         container_cmd = self._find_podman_or_docker()
         if container_cmd:
-            subprocess.run([container_cmd, 'stop', container_name], capture_output=True, timeout=10)
+            subprocess.run([container_cmd, 'stop', container_name], capture_output=True, timeout=30)
     
     def _image_exists(self, container_cmd, catalog_image):
         """檢查鏡像是否存在"""
         try:
             result = subprocess.run(
                 [container_cmd, 'images', '--format', '{{.Repository}}:{{.Tag}}', catalog_image],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=30
             )
             return catalog_image in result.stdout
         except:
@@ -104,8 +104,8 @@ class RegistryManager:
         """清理舊容器"""
         if status_callback:
             status_callback(f"🧹 清理舊容器...")
-        subprocess.run([container_cmd, 'stop', container_name], capture_output=True, timeout=10)
-        subprocess.run([container_cmd, 'rm', container_name], capture_output=True, timeout=10)
+        subprocess.run([container_cmd, 'stop', container_name], capture_output=True, timeout=30)
+        subprocess.run([container_cmd, 'rm', container_name], capture_output=True, timeout=30)
     
     def _start_container(self, container_cmd, container_name, port, authfile, catalog_image, status_callback=None):
         """啟動容器"""

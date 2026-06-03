@@ -2,9 +2,9 @@ import streamlit as st
 import time
 
 
-def render_readonly_field(label: str, value: str):
-    """渲染唯讀欄位"""
-    st.text_input(label, value=value, disabled=True)
+def render_readonly_field(label: str, value: str, key: str = None):
+    """渲染唯讀欄位，必須提供唯一的 key"""
+    st.text_input(label, value=value, disabled=True, key=key)
 
 
 def render_step1_config():

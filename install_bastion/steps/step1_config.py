@@ -3,8 +3,11 @@ import time
 
 
 def render_readonly_field(label: str, value: str, key: str = None):
-    """渲染唯讀欄位，必須提供唯一的 key"""
-    st.text_input(label, value=value, disabled=True, key=key)
+    """渲染唯讀欄位"""
+    params = {'label': label, 'value': value, 'disabled': True}
+    if key is not None:
+        params['key'] = key
+    st.text_input(**params)
 
 
 def render_step1_config():

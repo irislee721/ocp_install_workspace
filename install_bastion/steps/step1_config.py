@@ -1,14 +1,14 @@
 import streamlit as st
 import time
 
-
-def render_readonly_field(label: str, value: str, key: str = None):
-    """渲染唯讀欄位"""
-    params = {'label': label, 'value': value, 'disabled': True}
-    if key is not None:
-        params['key'] = key
-    st.text_input(**params)
-
+def _make_text_input_key(base_key: str, idx: int = None, field: str = None) -> str:
+    """生成唯一的 key"""
+    parts = [base_key]
+    if idx is not None:
+        parts.append(str(idx))
+    if field is not None:
+        parts.append(field)
+    return "_".join(parts)
 
 def render_step1_config():
     """步驟1: 確認環境配置"""
@@ -23,14 +23,44 @@ def render_step1_config():
     col1, col2 = st.columns(2)
     
     with col1:
-        render_readonly_field("叢集名稱 (clusterName)", config.get('clusterName', 'N/A'))
-        render_readonly_field("基礎網域 (baseDomain)", config.get('baseDomain', 'N/A'))
-        render_readonly_field("網路介面 (interface)", config.get('interface', 'N/A'))
+        st.text_input(
+            "叢集名稱 (clusterName)", 
+            value=config.get('clusterName', 'N/A'), 
+            disabled=True, 
+            key="cfg_cluster_name"
+        )
+        st.text_input(
+            "基礎網域 (baseDomain)", 
+            value=config.get('baseDomain', 'N/A'), 
+            disabled=True, 
+            key="cfg_base_domain"
+        )
+        st.text_input(
+            "網路介面 (interface)", 
+            value=config.get('interface', 'N/A'), 
+            disabled=True, 
+            key="cfg_interface"
+        )
         
     with col2:
-        render_readonly_field("堡壘主機 IP", config.get('bastion', {}).get('ip', 'N/A'))
-        render_readonly_field("部署模式", config.get('mode', 'N/A'))
-        render_readonly_field("上游 DNS", config.get('dns_upstream', 'N/A'))
+        st.text_input(
+            "堡壘主機 IP", 
+            value=config.get('bastion', {}).get('ip', 'N/A'), 
+            disabled=True, 
+            key="cfg_bastion_ip"
+        )
+        st.text_input(
+            "部署模式", 
+            value=config.get('mode', 'N/A'), 
+            disabled=True, 
+            key="cfg_mode"
+        )
+        st.text_input(
+            "上游 DNS", 
+            value=config.get('dns_upstream', 'N/A'), 
+            disabled=True, 
+            key="cfg_dns_upstream"
+        )
     
     # === 版本資訊（唯讀） ===
     version_info = config.get('versionInfo', {})
@@ -38,102 +68,86 @@ def render_step1_config():
         st.subheader("📦 版本資訊")
         col_v1, col_v2 = st.columns(2)
         with col_v1:
-            render_readonly_field("OCP Version", version_info.get('ocpVersion', 'N/A'))
+            st.text_input(
+                "OCP Version", 
+                value=version_info.get('ocpVersion', 'N/A'), 
+                disabled=True, 
+                key="cfg_ocp_version"
+            )
         with col_v2:
-            render_readonly_field("OCP Release", version_info.get('ocpRelease', 'N/A'))
+            st.text_input(
+                "OCP Release", 
+                value=version_info.get('ocpRelease', 'N/A'), 
+                disabled=True, 
+                key="cfg_ocp_release"
+            )
     
     # === 節點配置（唯讀） ===
     st.subheader("🖥️ 節點配置")
     
-    # Master 節點
-    master_nodes = config.get('master', [])
-    if master_nodes:
-        st.markdown("**Master 節點**")
-        for idx, node in enumerate(master_nodes):
+    # 輔助函數：渲染節點表格
+    def render_node_group(title: str, nodes: list, prefix: str):
+        if not nodes:
+            return
+        st.markdown(f"**{title}**")
+        for idx, node in enumerate(nodes):
             cols = st.columns(4)
             with cols[0]:
-                render_readonly_field(
-                    f"名稱", node.get('name', 'N/A'), 
-                    key=f"cfg_master_{idx}_name"
+                st.text_input(
+                    "名稱", 
+                    value=node.get('name', 'N/A'), 
+                    disabled=True, 
+                    key=f"cfg_{prefix}_{idx}_name"
                 )
             with cols[1]:
-                render_readonly_field(
-                    f"IP", node.get('ip', 'N/A'), 
-                    key=f"cfg_master_{idx}_ip"
+                st.text_input(
+                    "IP", 
+                    value=node.get('ip', 'N/A'), 
+                    disabled=True, 
+                    key=f"cfg_{prefix}_{idx}_ip"
                 )
             with cols[2]:
-                render_readonly_field(
-                    f"MAC", node.get('mac', 'N/A'), 
-                    key=f"cfg_master_{idx}_mac"
+                st.text_input(
+                    "MAC", 
+                    value=node.get('mac', 'N/A'), 
+                    disabled=True, 
+                    key=f"cfg_{prefix}_{idx}_mac"
                 )
             with cols[3]:
-                render_readonly_field(
-                    f"裝置", node.get('device', 'N/A'), 
-                    key=f"cfg_master_{idx}_device"
+                st.text_input(
+                    "裝置", 
+                    value=node.get('device', 'N/A'), 
+                    disabled=True, 
+                    key=f"cfg_{prefix}_{idx}_device"
                 )
+    
+    # Master 節點
+    render_node_group("Master 節點", config.get('master', []), "master")
     
     # Bootstrap 節點
     bootstrap = config.get('bootstrap', {})
     st.markdown("**Bootstrap 節點**")
     col_b1, col_b2 = st.columns(2)
     with col_b1:
-        render_readonly_field("Bootstrap 名稱", bootstrap.get('name', 'N/A'), key="cfg_bootstrap_name")
+        st.text_input(
+            "Bootstrap 名稱", 
+            value=bootstrap.get('name', 'N/A'), 
+            disabled=True, 
+            key="cfg_bootstrap_name"
+        )
     with col_b2:
-        render_readonly_field("Bootstrap IP", bootstrap.get('ip', 'N/A'), key="cfg_bootstrap_ip")
+        st.text_input(
+            "Bootstrap IP", 
+            value=bootstrap.get('ip', 'N/A'), 
+            disabled=True, 
+            key="cfg_bootstrap_ip"
+        )
     
     # Worker 節點
-    worker_nodes = config.get('worker', [])
-    if worker_nodes:
-        st.markdown("**Worker 節點**")
-        for idx, node in enumerate(worker_nodes):
-            cols = st.columns(4)
-            with cols[0]:
-                render_readonly_field(
-                    f"名稱", node.get('name', 'N/A'), 
-                    key=f"cfg_worker_{idx}_name"
-                )
-            with cols[1]:
-                render_readonly_field(
-                    f"IP", node.get('ip', 'N/A'), 
-                    key=f"cfg_worker_{idx}_ip"
-                )
-            with cols[2]:
-                render_readonly_field(
-                    f"MAC", node.get('mac', 'N/A'), 
-                    key=f"cfg_worker_{idx}_mac"
-                )
-            with cols[3]:
-                render_readonly_field(
-                    f"裝置", node.get('device', 'N/A'), 
-                    key=f"cfg_worker_{idx}_device"
-                )
+    render_node_group("Worker 節點", config.get('worker', []), "worker")
     
     # Infra 節點
-    infra_nodes = config.get('infra', [])
-    if infra_nodes:
-        st.markdown("**Infra 節點**")
-        for idx, node in enumerate(infra_nodes):
-            cols = st.columns(4)
-            with cols[0]:
-                render_readonly_field(
-                    f"名稱", node.get('name', 'N/A'), 
-                    key=f"cfg_infra_{idx}_name"
-                )
-            with cols[1]:
-                render_readonly_field(
-                    f"IP", node.get('ip', 'N/A'), 
-                    key=f"cfg_infra_{idx}_ip"
-                )
-            with cols[2]:
-                render_readonly_field(
-                    f"MAC", node.get('mac', 'N/A'), 
-                    key=f"cfg_infra_{idx}_mac"
-                )
-            with cols[3]:
-                render_readonly_field(
-                    f"裝置", node.get('device', 'N/A'), 
-                    key=f"cfg_infra_{idx}_device"
-                )
+    render_node_group("Infra 節點", config.get('infra', []), "infra")
     
     # === 網路配置 ===
     net_config = config.get('networkConfig', {})
@@ -142,18 +156,48 @@ def render_step1_config():
         col_n1, col_n2 = st.columns(2)
         with col_n1:
             if 'machineNetworkCidr' in net_config:
-                render_readonly_field("Machine Network CIDR", net_config['machineNetworkCidr'], key="cfg_machine_cidr")
+                st.text_input(
+                    "Machine Network CIDR", 
+                    value=net_config['machineNetworkCidr'], 
+                    disabled=True, 
+                    key="cfg_machine_cidr"
+                )
             if 'clusterNetworkCidr' in net_config:
-                render_readonly_field("Cluster Network CIDR", net_config['clusterNetworkCidr'], key="cfg_cluster_cidr")
+                st.text_input(
+                    "Cluster Network CIDR", 
+                    value=net_config['clusterNetworkCidr'], 
+                    disabled=True, 
+                    key="cfg_cluster_cidr"
+                )
             if 'serviceNetworkCidr' in net_config:
-                render_readonly_field("Service Network CIDR", net_config['serviceNetworkCidr'], key="cfg_service_cidr")
+                st.text_input(
+                    "Service Network CIDR", 
+                    value=net_config['serviceNetworkCidr'], 
+                    disabled=True, 
+                    key="cfg_service_cidr"
+                )
         with col_n2:
             if 'networkType' in net_config:
-                render_readonly_field("Network Type", net_config['networkType'], key="cfg_network_type")
+                st.text_input(
+                    "Network Type", 
+                    value=net_config['networkType'], 
+                    disabled=True, 
+                    key="cfg_network_type"
+                )
             if 'clusterNetworkHostPrefix' in net_config:
-                render_readonly_field("Host Prefix", str(net_config['clusterNetworkHostPrefix']), key="cfg_host_prefix")
+                st.text_input(
+                    "Host Prefix", 
+                    value=str(net_config['clusterNetworkHostPrefix']), 
+                    disabled=True, 
+                    key="cfg_host_prefix"
+                )
             if 'gatewayIp' in net_config:
-                render_readonly_field("Gateway IP", net_config['gatewayIp'], key="cfg_gateway_ip")
+                st.text_input(
+                    "Gateway IP", 
+                    value=net_config['gatewayIp'], 
+                    disabled=True, 
+                    key="cfg_gateway_ip"
+                )
     
     st.markdown("---")
     

@@ -1,107 +1,241 @@
 import os
 import subprocess
 import json
+import re
+from typing import Optional, Callable, List, Dict, Any, Tuple
 
-# 導入抽離的模組
 from src.logger import log_info, log_error, log_success
 from src.operator_manager import OperatorManager
 from src.registry_manager import RegistryManager
 
+class ProgressTracker:
+    """進度追蹤輔助類別"""
+    
+    def __init__(self, total_steps: int, callback: Optional[Callable[[float], None]] = None):
+        self.total = total_steps
+        self.current = 0
+        self.callback = callback
+    
+    def step(self) -> None:
+        """完成一個步驟"""
+        self.current += 1
+        if self.callback:
+            self.callback(self.current / self.total)
+
 class SetupWizard:
-    def __init__(self, current_dir=None):
+
+    # === URL 模板 ===
+    URL_OCP_CLIENT = (
+        "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{release}/"
+        "openshift-client-linux-{arch}-{rhel}-{release}.tar.gz"
+    )
+    URL_OCP_INSTALL = (
+        "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{release}/"
+        "openshift-install-{rhel}-{arch}.tar.gz"
+    )
+    URL_OC_MIRROR = (
+        "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{release}/"
+        "oc-mirror.{rhel}.tar.gz"
+    )
+    URL_BUTANE = "https://mirror.openshift.com/pub/openshift-v4/clients/butane/latest/butane-{arch}"
+    URL_HELM = (
+        "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/helm/"
+        "{helm_ver}/helm-linux-{arch}.tar.gz"
+    )
+    URL_MIRROR_REGISTRY = (
+        "https://mirror.openshift.com/pub/cgw/mirror-registry/{mirror_ver}/"
+        "mirror-registry-{arch}.tar.gz"
+    )
+    URL_GRPCURL = "https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz"
+    URL_TRIDENT = "https://github.com/NetApp/trident/releases/download/v{ver}/trident-installer-{ver}.tar.gz"
+    
+    DEFAULT_GRPCURL_VERSION = "1.9.3" 
+    DIR_INSTALL_SOURCE = "install_source"
+    DIR_INSTALL_OCP = "install/ocp"
+    DIR_DOCKER = ".docker"
+    DIR_MIRROR = "mirror"
+
+    def __init__(self, current_dir: Optional[str] = None):
         """初始化基礎目錄結構與子模組"""
-        if current_dir:
-            self.current_dir = current_dir
-        else:
-            self.current_dir = os.getcwd()
+        self.current_dir = current_dir or os.getcwd()
         
-        # 定義基礎目錄結構
+        # 初始化目錄結構
         self.config_dir = os.path.join(self.current_dir, 'config')
+        self.install_source_dir = os.path.join(self.current_dir, self.DIR_INSTALL_SOURCE)
+        self.install_ocp_dir = os.path.join(self.current_dir, *self.DIR_INSTALL_OCP.split('/'))
+        self.docker_config_dir = os.path.join(self.current_dir, self.DIR_DOCKER)
+        
+        # 確保必要目錄存在
         os.makedirs(self.config_dir, exist_ok=True)
         
-        self.install_source_dir = os.path.join(self.current_dir, "install_source")
-        self.install_ocp_dir = os.path.join(self.current_dir, "install", "ocp")
-        self.docker_config_dir = os.path.join(self.current_dir, ".docker")
-        
-        # 初始化子模組
+        # 依賴注入：初始化子模組
         self.op_mgr = OperatorManager(current_dir)
         self.registry = RegistryManager(current_dir)
 
-    def apply_pull_secret(self, pull_secret_json):
-        """將使用者提供的 pull secret 合併到認證配置中"""
+    def apply_pull_secret(self, pull_secret_json: dict) -> bool:
+        """
+        合併 Pull Secret 到 Docker 認證配置
+        
+        Args:
+            pull_secret_json: Pull Secret JSON 物件
+            
+        Returns:
+            是否成功
+        """
         docker_config_path = os.path.join(os.path.expanduser("~"), ".docker", "config.json")
         
-        existing = {}
-        if os.path.exists(docker_config_path):
-            try:
-                with open(docker_config_path, 'r') as f:
-                    existing = json.load(f)
-            except Exception:
-                pass
+        # 讀取現有配置
+        existing = self._read_json_file(docker_config_path, {})
         
+        # 合併 auths
         existing_auths = existing.get('auths', {})
         for registry, auth in pull_secret_json.get('auths', {}).items():
             existing_auths[registry] = auth
         existing['auths'] = existing_auths
         
+        # 寫入多個位置
+        return self._write_pull_secret_to_all_locations(existing, docker_config_path)
+
+    def _read_json_file(self, path: str, default: Any = None) -> Any:
+        """安全讀取 JSON 檔案"""
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return default if default is not None else {}
+
+    def _write_pull_secret_to_all_locations(self, data: dict, docker_config_path: str) -> bool:
+        """將 Pull Secret 寫入所有必要位置"""
         try:
+            # 主要位置
             os.makedirs(os.path.dirname(docker_config_path), exist_ok=True)
-            with open(docker_config_path, 'w') as f:
-                json.dump(existing, f, indent=2)
+            self._write_json_file(docker_config_path, data)
             
-            # 同步到 config 目錄
+            # 備份到 config 目錄
             config_path = os.path.join(self.config_dir, 'pull-secret.json')
-            with open(config_path, 'w') as f:
-                json.dump(existing, f, indent=2)
+            self._write_json_file(config_path, data)
             
-            # 同步到工作目錄
-            work_dir = os.path.join(self.current_dir, ".docker")
+            # 工作目錄
+            work_dir = os.path.join(self.current_dir, self.DIR_DOCKER)
             os.makedirs(work_dir, exist_ok=True)
-            with open(os.path.join(work_dir, "config.json"), 'w') as f:
-                json.dump(existing, f, indent=2)
+            self._write_json_file(os.path.join(work_dir, "config.json"), data)
             
             log_success("Pull secret 已合併到 Docker 認證")
             return True
         except Exception as e:
             log_error(f"合併 pull secret 失敗: {e}")
-            return False 
+            return False
 
-    def run_env_prep(self):
-        """建立 install_source、.docker、install/ocp 等工作目錄"""
+    def _write_json_file(self, path: str, data: dict) -> None:
+        """寫入 JSON 檔案"""
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def run_env_prep(self) -> bool:
+        """建立必要的工作目錄"""
         log_info("開始執行 env_prep...")
         
-        create_dirs = [
+        dirs_to_create = [
             self.install_source_dir,
             self.docker_config_dir,
             self.install_ocp_dir,
-            os.path.join(self.install_source_dir, "mirror")
+            os.path.join(self.install_source_dir, self.DIR_MIRROR)
         ]
         
-        for dir_path in create_dirs:
-            if not os.path.isdir(dir_path):
-                try:
-                    os.makedirs(dir_path, exist_ok=True)
-                    log_success(f"創建成功: {dir_path}")
-                except Exception as e:
-                    log_error(f"創建失敗：{e}")
-                    return False
+        for dir_path in dirs_to_create:
+            if not self._create_directory(dir_path):
+                return False
         
         log_success("env_prep 執行完成")
         return True
 
-    def download_file(self, url, destination_dir):
-        """使用 wget 下載單一檔案，若已存在則跳過"""
-        url = url.strip().replace(" ", "")
-        filename = os.path.basename(url.split('?')[0])
-        dest_path = os.path.join(destination_dir, filename)
+    def _create_directory(self, path: str) -> bool:
+        """安全建立目錄"""
+        if os.path.isdir(path):
+            return True
+        
+        try:
+            os.makedirs(path, exist_ok=True)
+            log_success(f"創建成功: {path}")
+            return True
+        except Exception as e:
+            log_error(f"創建失敗：{e}")
+            return False
+
+    def run_get_tools(self, config: dict, progress_callback: Optional[Callable[[float], None]] = None) -> bool:
+        """下載必要工具"""
+        log_info("開始執行 get_tools...")
+        
+        downloads = self._build_download_list(config)
+        tracker = ProgressTracker(len(downloads), progress_callback)
+        
+        os.makedirs(self.install_source_dir, exist_ok=True)
+        
+        for url, filename in downloads:
+            if not self._download_if_not_exists(url, filename):
+                return False
+            tracker.step()
+        
+        log_info("get_tools 執行完成")
+        return True
+
+    def _build_download_list(self, config: dict) -> List[tuple]:
+        """構建下載列表"""
+        v_info = config.get('version_info', {})
+        csi_info = config.get('csi_info', {})
+        
+        params = {
+            'release': v_info.get('OCP_RELEASE', ''),
+            'arch': v_info.get('ARCHITECTURE', ''),
+            'rhel': v_info.get('RHEL_VERSION', ''),
+            'helm_ver': v_info.get('HELM_VERSION', ''),
+            'mirror_ver': v_info.get('MIRROR_REGISTRY_VERSION', ''),
+        }
+        
+        downloads = [
+            (self.URL_OCP_CLIENT.format(**params), f"openshift-client-linux-{params['arch']}-{params['rhel']}-{params['release']}.tar.gz"),
+            (self.URL_OCP_INSTALL.format(**params), f"openshift-install-{params['rhel']}-{params['arch']}.tar.gz"),
+            (self.URL_OC_MIRROR.format(**params), f"oc-mirror.{params['rhel']}.tar.gz"),
+            (self.URL_BUTANE.format(**params), f"butane-{params['arch']}"),
+            (self.URL_HELM.format(**params), f"helm-linux-{params['arch']}.tar.gz"),
+            (self.URL_MIRROR_REGISTRY.format(**params), f"mirror-registry-{params['arch']}.tar.gz"),
+            (self.URL_GRPCURL, f"grpcurl_{self.DEFAULT_GRPCURL_VERSION}_linux_x86_64.tar.gz"),
+        ]
+        
+        # 條件性添加 Trident
+        if csi_info.get('CSI_TYPE') == "trident":
+            trident_ver = csi_info.get('TRIDENT_INSTALLER', '')
+            if trident_ver:
+                downloads.append(
+                    (self.URL_TRIDENT.format(ver=trident_ver), f"trident-installer-{trident_ver}.tar.gz")
+                )
+        
+        return downloads
+    
+    def _download_if_not_exists(self, url: str, filename: str) -> bool:
+        """如果檔案不存在則下載"""
+        dest_path = os.path.join(self.install_source_dir, filename)
         
         if os.path.exists(dest_path):
             log_info(f"文件已存在，跳過下載：{filename}")
             return True
         
+        return self.download_file(url, self.install_source_dir)
+    
+    def download_file(self, url: str, destination_dir: str) -> bool:
+        """使用 wget 下載檔案"""
+        url = url.strip().replace(" ", "")
+        filename = os.path.basename(url.split('?')[0])
+        
+        log_info(f"正在下載：{filename}...")
+        
         try:
-            log_info(f"正在下載：{filename}...")
-            subprocess.run(['wget', '-q', '--show-progress', url, '-P', destination_dir], check=True)
+            subprocess.run(
+                ['wget', '-q', '--show-progress', url, '-P', destination_dir],
+                check=True
+            )
             return True
         except subprocess.CalledProcessError as e:
             log_error(f"下載失敗：{filename}, 錯誤：{e}")
@@ -110,175 +244,134 @@ class SetupWizard:
             log_error("未找到 wget 命令")
             return False
 
-    def run_get_tools(self, config, progress_callback=None):
-        """根據 config 版本資訊下載 oc-mirror、grpcurl 等必要工具"""
-        log_info("開始執行 get_tools...")
-        
-        v_info = config.get('version_info', {})
-        csi_info = config.get('csi_info', {})
-        
-        ocp_release = v_info.get('OCP_RELEASE', '')
-        architecture = v_info.get('ARCHITECTURE', '')
-        rhel_version = v_info.get('RHEL_VERSION', '')
-        helm_version = v_info.get('HELM_VERSION', '')
-        mirror_registry_version = v_info.get('MIRROR_REGISTRY_VERSION', '')
-        trident_installer = csi_info.get('TRIDENT_INSTALLER', '')
-        csi_type = csi_info.get('CSI_TYPE', 'nfs-csi')
-        
-        os.makedirs(self.install_source_dir, exist_ok=True)
-        
-        downloads = [
-            (f"https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{ocp_release}/openshift-client-linux-{architecture}-{rhel_version}-{ocp_release}.tar.gz",
-             f"openshift-client-linux-{architecture}-{rhel_version}-{ocp_release}.tar.gz"),
-            (f"https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{ocp_release}/openshift-install-{rhel_version}-{architecture}.tar.gz",
-             f"openshift-install-{rhel_version}-{architecture}.tar.gz"),
-            (f"https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{ocp_release}/oc-mirror.{rhel_version}.tar.gz",
-             f"oc-mirror.{rhel_version}.tar.gz"),
-            (f"https://mirror.openshift.com/pub/openshift-v4/clients/butane/latest/butane-{architecture}",
-             f"butane-{architecture}"),
-            (f"https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/helm/{helm_version}/helm-linux-{architecture}.tar.gz",
-             f"helm-linux-{architecture}.tar.gz"),
-            (f"https://mirror.openshift.com/pub/cgw/mirror-registry/{mirror_registry_version}/mirror-registry-{architecture}.tar.gz",
-             f"mirror-registry-{architecture}.tar.gz"),
-            (f"https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz",
-             f"grpcurl_1.9.3_linux_x86_64.tar.gz")
-        ]
-        
-        if csi_type == "trident":
-            downloads.append(
-                (f"https://github.com/NetApp/trident/releases/download/v{trident_installer}/trident-installer-{trident_installer}.tar.gz",
-                 f"trident-installer-{trident_installer}.tar.gz")
-            )
-        
-        total_steps = len(downloads)
-        current_step = 0
-        
-        def step_done():
-            nonlocal current_step
-            current_step += 1
-            if progress_callback:
-                progress_callback(current_step / total_steps)
-        
-        for url, filename in downloads:
-            dest_path = os.path.join(self.install_source_dir, filename)
-            if os.path.exists(dest_path):
-                log_info(f"文件已存在，跳過下載：{filename}")
-                step_done()
-                continue
-            
-            if not self.download_file(url, self.install_source_dir):
-                log_error(f"下載失敗：{filename}")
-                return False
-            
-            step_done()
-        
-        log_info("get_tools 執行完成")
-        return True
-
-    def run_get_operator_catalog_via_grpc(self, config, status_callback=None):
-        """使用 gRPC 獲取 Operator Catalog 並創建 operator_index.json"""
-        if status_callback:
-            status_callback("🔍 初始化 Operator Catalog 獲取任務...")
-            status_callback("🔧 尋找 grpcurl 命令...")
-        
-        # 改用 self.op_mgr
-        grpcurl_cmd = self.op_mgr.find_grpcurl()
+    def run_get_operator_catalog_via_grpc(
+        self, 
+        config: dict, 
+        status_callback: Optional[Callable[[str], None]] = None
+    ) -> bool:
+        """使用 gRPC 獲取 Operator Catalog"""
+        # 步驟1: 檢查 grpcurl
+        grpcurl_cmd = self._ensure_grpcurl_available(status_callback)
         if not grpcurl_cmd:
-            if status_callback:
-                status_callback("❌ 找不到 grpcurl 命令")
             return False
         
-        if status_callback:
-            status_callback(f"✅ 找到 grpcurl: {grpcurl_cmd}")
+        # 步驟2: 確保容器運行
+        container_name, port = self._ensure_container_running(config, status_callback)
+        if not container_name:
+            return False
         
-        # 啟動 Registry 容器
-        success, container_name, port = self.registry.start_operator_registry(config, status_callback)
+        # 步驟3: 查詢並儲存
+        return self._fetch_and_save_catalog(grpcurl_cmd, port, container_name, status_callback)
+
+    def _ensure_grpcurl_available(self, status_callback: Optional[Callable] = None) -> Optional[str]:
+        """確保 grpcurl 可用"""
+        self._notify(status_callback, "🔍 初始化 Operator Catalog 獲取任務...")
+        self._notify(status_callback, "🔧 尋找 grpcurl 命令...")
+        
+        grpcurl_cmd = self.op_mgr.find_grpcurl()
+        
+        if grpcurl_cmd:
+            self._notify(status_callback, f"✅ 找到 grpcurl: {grpcurl_cmd}")
+        else:
+            self._notify(status_callback, "❌ 找不到 grpcurl 命令")
+        
+        return grpcurl_cmd
+    
+    def _ensure_container_running(
+        self, 
+        config: dict, 
+        status_callback: Optional[Callable] = None
+    ) -> tuple:
+        """確保容器正在運行"""
+        self._notify(status_callback, "📦 檢查容器狀態...")
+        
+        container_name = self._get_container_name(config)
+        
+        if self._check_container_running(container_name):
+            self._notify(status_callback, f"✅ 容器已在運行: {container_name}")
+            return container_name, RegistryManager.DEFAULT_PORT
+        
+        self._notify(status_callback, "📦 容器未運行，正在啟動...")
+        success, name, port = self.registry.start_operator_registry(config, status_callback)
+        
         if not success:
-            if status_callback:
-                status_callback("❌ 啟動 Registry 容器失敗")
-            return False
+            self._notify(status_callback, "❌ 啟動 Registry 容器失敗")
+            return None, None
         
+        return name, port
+
+    def _fetch_and_save_catalog(
+        self,
+        grpcurl_cmd: str,
+        port: int,
+        container_name: str,
+        status_callback: Optional[Callable] = None
+    ) -> bool:
+        """查詢並儲存 Operator Catalog"""
         try:
-            if status_callback:
-                status_callback("📡 查詢所有 Packages...")
-            
-            # 改用 self.op_mgr
+            # 查詢 packages
+            self._notify(status_callback, "📡 查詢所有 Packages...")
             output = self.op_mgr.list_packages_grpc(grpcurl_cmd, port)
+            
             if not output:
-                if status_callback:
-                    status_callback("❌ 查詢失敗")
+                self._notify(status_callback, "❌ gRPC 查詢失敗")
                 return False
             
-            # 改用 self.op_mgr
+            # 解析
             package_names = self.op_mgr.parse_list_output(output)
             if not package_names:
-                if status_callback:
-                    status_callback("❌ 解析失敗：未找到任何 package")
+                self._notify(status_callback, f"❌ 解析失敗，原始輸出: {output[:500]}")
                 return False
             
-            if status_callback:
-                status_callback(f"📦 找到 {len(package_names)} 個 packages，正在獲取詳細資訊...")
+            self._notify(status_callback, f"📦 找到 {len(package_names)} 個 packages，正在獲取詳細資訊...")
             
-            packages = []
-            for i, pkg_name in enumerate(package_names):
-                if status_callback and i % 20 == 0:
-                    status_callback(f"⏳ 處理中... ({i+1}/{len(package_names)})")
-                
-                # 改用 self.op_mgr
-                pkg_info = self.op_mgr.get_package_basic_info(grpcurl_cmd, port, pkg_name)
-                if pkg_info:
-                    packages.append(pkg_info)
+            # 獲取詳細資訊
+            packages, error_count = self._fetch_package_details(
+                grpcurl_cmd, port, package_names, status_callback
+            )
             
-            if status_callback:
-                status_callback("💾 儲存 operator_index.json...")
-            
-            # 改用 self.op_mgr 的儲存方法
+            # 儲存
+            self._notify(status_callback, f"💾 儲存 operator_index.json ({len(packages)} packages, {error_count} 錯誤)...")
             self.op_mgr.save_operator_index(packages)
             
-            if status_callback:
-                status_callback(f"✅ operator_index.json 已創建 ({len(packages)} packages)")
+            self._notify(status_callback, f"✅ operator_index.json 已創建 ({len(packages)} packages)")
+            self._notify(status_callback, "💡 容器保持運行，可手動關閉")
             
             return True
             
-        finally:
-            self.registry.stop_operator_registry(container_name)
-            if status_callback:
-                status_callback("🧹 容器已清除")
-    
-    def get_package_version_grpc(self, grpcurl_cmd, port, package_name, channel_name, max_retries=3):
-        """透過 gRPC 查詢指定 channel 的最新版本，委派給 OperatorManager 處理"""
-        # 改用 self.op_mgr
-        return self.op_mgr.get_bundle_version(grpcurl_cmd, port, package_name, channel_name, max_retries)
-    
-    def _find_grpcurl(self):
-        """尋找 grpcurl 命令路徑，向後相容的封裝方法"""
-        return self.op_mgr.find_grpcurl()
-  
-    def _extract_tar(self, tar_path, target_dir, binary_name):
-        """解壓 tar.gz 檔案並設定執行權限，回傳解壓後的二進位檔路徑"""
-        if not os.path.exists(tar_path):
-            log_error(f"找不到 tar 包：{tar_path}")
-            return None
+        except Exception as e:
+            self._notify(status_callback, f"❌ 發生錯誤: {str(e)}")
+            return False
+
+    def _fetch_package_details(
+        self,
+        grpcurl_cmd: str,
+        port: int,
+        package_names: List[str],
+        status_callback: Optional[Callable] = None
+    ) -> tuple:
+        """獲取所有 package 的詳細資訊"""
+        packages = []
+        error_count = 0
+        max_errors_to_show = 5
         
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir, exist_ok=True)
-        
-        try:
-            subprocess.run(["tar", "-zxvf", tar_path, "-C", target_dir],
-                          check=True, capture_output=True, text=True)
+        for i, pkg_name in enumerate(package_names):
+            if status_callback and i % 20 == 0:
+                status_callback(f"⏳ 處理中... ({i+1}/{len(package_names)})")
             
-            target_binary = os.path.join(target_dir, binary_name)
-            if os.path.isfile(target_binary):
-                os.chmod(target_binary, 0o755)
-                log_success(f"已設置執行權限：{target_binary}")
-                return target_binary
-            return None
-        except subprocess.CalledProcessError as e:
-            log_error(f"解壓失敗：{e}")
-            return None
-    
-    def run_untar_oc_mirror(self, config):
-        """解壓 oc-mirror 工具到 ~/.local/bin"""
+            try:
+                pkg_info = self.op_mgr.get_package_basic_info(grpcurl_cmd, port, pkg_name)
+                if pkg_info:
+                    packages.append(pkg_info)
+            except Exception as e:
+                error_count += 1
+                if error_count <= max_errors_to_show and status_callback:
+                    status_callback(f"⚠️ 獲取 {pkg_name} 失敗: {str(e)}")
+        
+        return packages, error_count
+
+    def run_untar_oc_mirror(self, config: dict) -> bool:
+        """解壓 oc-mirror"""
         v_info = config.get('version_info', {})
         rhel_version = v_info.get('RHEL_VERSION', 'rhel9')
         tar_filename = f"oc-mirror.{rhel_version}.tar.gz"
@@ -287,10 +380,58 @@ class SetupWizard:
         result = self._extract_tar(tar_path, os.path.expanduser("~/.local/bin"), "oc-mirror")
         return result is not None
     
-    def run_untar_grpcurl(self, config):
-        """解壓 grpcurl 工具到 ~/.local/bin"""
-        tar_filename = "grpcurl_1.9.3_linux_x86_64.tar.gz"
+    def run_untar_grpcurl(self, config: dict) -> bool:
+        """解壓 grpcurl"""
+        tar_filename = f"grpcurl_{self.DEFAULT_GRPCURL_VERSION}_linux_x86_64.tar.gz"
         tar_path = os.path.join(self.install_source_dir, tar_filename)
         
         result = self._extract_tar(tar_path, os.path.expanduser("~/.local/bin"), "grpcurl")
         return result is not None
+    
+    def _extract_tar(self, tar_path: str, target_dir: str, binary_name: str) -> Optional[str]:
+        """解壓 tar 檔案並設定執行權限"""
+        if not os.path.exists(tar_path):
+            log_error(f"找不到 tar 包：{tar_path}")
+            return None
+        
+        os.makedirs(target_dir, exist_ok=True)
+        
+        try:
+            subprocess.run(
+                ["tar", "-zxvf", tar_path, "-C", target_dir],
+                check=True, capture_output=True, text=True
+            )
+            
+            target_binary = os.path.join(target_dir, binary_name)
+            if os.path.isfile(target_binary):
+                os.chmod(target_binary, 0o755)
+                log_success(f"已設置執行權限：{target_binary}")
+                return target_binary
+            
+            return None
+        except subprocess.CalledProcessError as e:
+            log_error(f"解壓失敗：{e}")
+            return None
+        
+    def _get_container_name(self, config: dict) -> str:
+        """從配置取得容器名稱"""
+        v_info = config.get('version_info', {})
+        ocp_release = v_info.get('OCP_RELEASE', RegistryManager.DEFAULT_OCP_RELEASE)
+        match = re.match(r'(\d+\.\d+)', ocp_release)
+        ocp_version = match.group(1) if match else RegistryManager.DEFAULT_OCP_VERSION
+        return RegistryManager.CONTAINER_NAME_TEMPLATE.format(version=ocp_version)
+    
+    def _check_container_running(self, container_name: str) -> bool:
+        """檢查容器是否運行"""
+        return self.registry.check_container_running(container_name)
+    
+    def _notify(self, callback: Optional[Callable], message: str) -> None:
+        """發送通知"""
+        if callback:
+            callback(message)
+
+    def _find_grpcurl(self) -> Optional[str]:
+        return self.op_mgr.find_grpcurl()
+    
+    def get_package_version_grpc(self, grpcurl_cmd, port, package_name, channel_name, max_retries=3):
+        return self.op_mgr.get_bundle_version(grpcurl_cmd, port, package_name, channel_name, max_retries)

@@ -5,6 +5,16 @@
 ### Architecture
 ![alt text](<image/ocp install python app architecture.png>)
 
+### Version Info
+* using uv 
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+* using python 3.12
+```bash
+uv venv --python 3.12
+```
+
 ### How to start
 1. install streamlit package
 

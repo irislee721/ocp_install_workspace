@@ -3,266 +3,532 @@ import json
 import os
 from datetime import datetime
 import time
+import re
+from typing import Optional, Callable, Any
 
 from src.config_manager import ConfigManager
 from src.setup_wizard import SetupWizard
+from src.registry_manager import RegistryManager
 
-CURRENT_DIR = os.getcwd()
-CONFIG_DIR = os.path.join(CURRENT_DIR, 'config')
-os.makedirs(CONFIG_DIR, exist_ok=True)
 
-def show_tool_config_page():
-    """渲染工具配置頁面，包含 Pull Secret、工具版本設定及 Operator Index 獲取"""    
-    st.title("1. 🔧 Tool Configuration & Environment Setup")
-    st.markdown("配置需要下載的工具版本，並執行環境初始化。")
+class SessionKeys:
+    """Session State 鍵名常數"""
+    PULL_SECRET_MERGED = 'pull_secret_merged'
+    REGISTRY_LOGGED_IN = 'registry_logged_in'
+    ENV_READY = 'env_ready'
+    TOOLS_DOWNLOADED = 'tools_downloaded'
+    CURRENT_VIEW = 'current_view'
+
+
+class ToolConfigUI:
+    """工具配置頁面 UI 類別"""
     
-    config_manager = ConfigManager('tool_config.json')
-    config = config_manager.get_config()
-    wizard = SetupWizard(CURRENT_DIR)
-
-    _render_pull_secret(wizard)
-    st.divider()
-    _render_tool_config_form(config_manager, config, wizard)
-    _render_fetch_operator_catalog(config, wizard)
-    st.divider()
-    render_next_button()
-
-def _render_pull_secret(wizard):
-    """渲染 Pull Secret 上傳與驗證區塊，支援貼上 JSON 或上傳 txt 檔案"""
-    with st.expander("🔐 OpenShift Pull Secret Configuration", expanded=True):
+    # === 常數 ===
+    CONFIG_FILE = 'tool_config.json'
+    INDEX_FILE = 'operator_index.json'
+    
+    def __init__(self):
+        """初始化 UI 類別"""
+        self.current_dir = os.getcwd()
+        self.config_dir = os.path.join(self.current_dir, 'config')
+        os.makedirs(self.config_dir, exist_ok=True)
+        
+        # 初始化後端組件
+        self.config_manager = ConfigManager(self.CONFIG_FILE)
+        self.wizard = SetupWizard(self.current_dir)
+    
+    # === 主渲染方法 ===
+    
+    def render(self) -> None:
+        """渲染整個工具配置頁面"""
+        st.title("1. 🔧 Tool Configuration & Environment Setup")
+        st.markdown("配置需要下載的工具版本，並執行環境初始化。")
+        
+        config = self.config_manager.get_config()
+        
+        self._render_pull_secret_section()
+        st.divider()
+        self._render_tool_config_section(config)
+        self._render_operator_catalog_section(config)
+        st.divider()
+        self._render_next_button()
+    
+    # === Pull Secret 區塊 ===
+    
+    def _render_pull_secret_section(self) -> None:
+        """渲染 Pull Secret 上傳區塊"""
+        with st.expander("🔐 OpenShift Pull Secret Configuration", expanded=True):
+            if st.session_state.get(SessionKeys.PULL_SECRET_MERGED, False):
+                self._render_pull_secret_success()
+                return
+            
+            self._render_pull_secret_instructions()
+            pull_secret_json = self._get_pull_secret_input()
+            
+            if pull_secret_json:
+                self._validate_and_apply_pull_secret(pull_secret_json)
+    
+    def _render_pull_secret_success(self) -> None:
+        """渲染 Pull Secret 已配置狀態"""
+        st.success("✅ Pull secret 已配置完成")
+        if st.button("🔄 重新上傳"):
+            st.session_state[SessionKeys.PULL_SECRET_MERGED] = False
+            st.rerun()
+    
+    def _render_pull_secret_instructions(self) -> None:
+        """渲染 Pull Secret 說明"""
         st.markdown("""
-        請提供 OpenShift Pull Secret。從 [Red Hat Console](https://console.redhat.com/openshift/downloads#tool-pull-secret) 下載。
+        請提供 OpenShift Pull Secret。
+        從 [Red Hat Console](https://console.redhat.com/openshift/downloads#tool-pull-secret) 下載。
         """)
-        
-        if st.session_state.get('pull_secret_merged', False):
-            st.success("✅ Pull secret 已配置完成")
-            if st.button("🔄 重新上傳"):
-                st.session_state.pull_secret_merged = False
-                st.rerun()
-            return
-        
-        # 上傳方式選擇
+    
+    def _get_pull_secret_input(self) -> Optional[dict]:
+        """取得 Pull Secret 輸入"""
         upload_method = st.radio(
             "選擇上傳方式",
             ["📋 貼上 JSON 內容", "📁 上傳 pull-secret.txt"],
             horizontal=True
         )
         
-        pull_secret_json = None
-        
         if upload_method == "📋 貼上 JSON 內容":
-            pull_secret_text = st.text_area(
-                "Pull Secret (JSON)", height=200,
-                placeholder='{"auths":{"cloud.openshift.com":{...},...}}',
-                key="pull_secret_text"
-            )
-            if pull_secret_text:
-                try:
-                    pull_secret_json = json.loads(pull_secret_text)
-                except json.JSONDecodeError:
-                    st.error("❌ 無效的 JSON 格式")
+            return self._get_pull_secret_from_text()
         else:
-            uploaded_file = st.file_uploader(
-                "上傳 pull-secret.txt",
-                type=["txt", "json"],
-                key="pull_secret_file"
-            )
-            if uploaded_file:
-                try:
-                    pull_secret_json = json.loads(uploaded_file.read().decode('utf-8'))
-                    st.success(f"✅ 已讀取: {uploaded_file.name}")
-                except json.JSONDecodeError:
-                    st.error("❌ 無效的 JSON 格式")
+            return self._get_pull_secret_from_file()
+    
+    def _get_pull_secret_from_text(self) -> Optional[dict]:
+        """從文字框取得 Pull Secret"""
+        pull_secret_text = st.text_area(
+            "Pull Secret (JSON)", height=200,
+            placeholder='{"auths":{"cloud.openshift.com":{...},...}}',
+            key="pull_secret_text"
+        )
+        if pull_secret_text:
+            try:
+                return json.loads(pull_secret_text)
+            except json.JSONDecodeError:
+                st.error("❌ 無效的 JSON 格式")
+        return None
+    
+    def _get_pull_secret_from_file(self) -> Optional[dict]:
+        """從上傳檔案取得 Pull Secret"""
+        uploaded_file = st.file_uploader(
+            "上傳 pull-secret.txt",
+            type=["txt", "json"],
+            key="pull_secret_file"
+        )
+        if uploaded_file:
+            try:
+                data = json.loads(uploaded_file.read().decode('utf-8'))
+                st.success(f"✅ 已讀取: {uploaded_file.name}")
+                return data
+            except json.JSONDecodeError:
+                st.error("❌ 無效的 JSON 格式")
+        return None
+    
+    def _validate_and_apply_pull_secret(self, pull_secret_json: dict) -> None:
+        """驗證並套用 Pull Secret"""
+        if 'auths' not in pull_secret_json:
+            st.error("❌ 缺少 'auths' 欄位")
+            return
         
-        # 驗證並套用
-        if pull_secret_json:
-            if 'auths' not in pull_secret_json:
-                st.error("❌ 缺少 'auths' 欄位")
+        registries = list(pull_secret_json['auths'].keys())
+        required = ['quay.io', 'registry.redhat.io']
+        missing = [r for r in required if r not in registries]
+        
+        st.info(f"📋 包含 {len(registries)} 個 registry 認證")
+        
+        if missing:
+            st.error(f"❌ 缺少必要認證：{', '.join(missing)}")
+            return
+        
+        st.success("✅ 包含 quay.io 和 registry.redhat.io 認證")
+        
+        if st.button("🔗 套用 Pull Secret", type="primary"):
+            if self.wizard.apply_pull_secret(pull_secret_json):
+                st.session_state[SessionKeys.PULL_SECRET_MERGED] = True
+                st.session_state[SessionKeys.REGISTRY_LOGGED_IN] = True
+                st.rerun()
             else:
-                registries = list(pull_secret_json['auths'].keys())
-                required = ['quay.io', 'registry.redhat.io']
-                missing = [r for r in required if r not in registries]
-                
-                st.info(f"📋 包含 {len(registries)} 個 registry 認證")
-                if missing:
-                    st.error(f"❌ 缺少必要認證：{', '.join(missing)}")
-                else:
-                    st.success("✅ 包含 quay.io 和 registry.redhat.io 認證")
-                    
-                    if st.button("🔗 套用 Pull Secret", type="primary"):
-                        if wizard.apply_pull_secret(pull_secret_json):
-                            st.session_state.pull_secret_merged = True
-                            st.session_state.registry_logged_in = True
-                            st.rerun()
-                        else:
-                            st.error("❌ 寫入失敗")
-
-def _render_tool_config_form(config_manager, config, wizard):
-    """渲染工具版本配置表單，提交後依序執行 env_prep、get_tools、解壓"""
-    with st.form("tool_config_form"):
-        st.subheader("Version Information")
+                st.error("❌ 寫入失敗")
+    
+    # === 工具配置表單 ===
+    
+    def _render_tool_config_section(self, config: dict) -> None:
+        """渲染工具版本配置表單"""
+        with st.form("tool_config_form"):
+            st.subheader("Version Information")
+            
+            updated_config = self._render_version_form_fields(config)
+            
+            if st.form_submit_button("Save & Run Environment Setup"):
+                self._execute_environment_setup(updated_config)
+    
+    def _render_version_form_fields(self, config: dict) -> dict:
+        """渲染版本配置欄位"""
         col1, col2 = st.columns(2)
+        
         with col1:
-            config['version_info']['OCP_RELEASE'] = st.text_input("OCP Release (e.g. 4.20.8)", value=config['version_info']['OCP_RELEASE'])
-            config['version_info']['RHEL_VERSION'] = st.selectbox("RHEL Version", ["rhel9", "rhel10"], index=0 if config['version_info']['RHEL_VERSION'] == 'rhel9' else 1)
+            config['version_info']['OCP_RELEASE'] = st.text_input(
+                "OCP Release (e.g. 4.20.8)",
+                value=config['version_info']['OCP_RELEASE']
+            )
+            config['version_info']['RHEL_VERSION'] = st.selectbox(
+                "RHEL Version", ["rhel9", "rhel10"],
+                index=0 if config['version_info']['RHEL_VERSION'] == 'rhel9' else 1
+            )
+        
         with col2:
-            config['version_info']['ARCHITECTURE'] = st.selectbox("Architecture", ["amd64", "arm64"], index=0 if config['version_info']['ARCHITECTURE'] == 'amd64' else 1)
-            config['version_info']['HELM_VERSION'] = st.text_input("Helm Version", value=config['version_info']['HELM_VERSION'])
-            config['version_info']['MIRROR_REGISTRY_VERSION'] = st.text_input("Mirror Registry Version", value=config['version_info']['MIRROR_REGISTRY_VERSION'])
-
-        if st.form_submit_button("Save & Run Environment Setup"):
-            config_manager.save_config(config)
-            st.success("配置已保存！開始執行環境初始化...")
+            config['version_info']['ARCHITECTURE'] = st.selectbox(
+                "Architecture", ["amd64", "arm64"],
+                index=0 if config['version_info']['ARCHITECTURE'] == 'amd64' else 1
+            )
+            config['version_info']['HELM_VERSION'] = st.text_input(
+                "Helm Version",
+                value=config['version_info']['HELM_VERSION']
+            )
+            config['version_info']['MIRROR_REGISTRY_VERSION'] = st.text_input(
+                "Mirror Registry Version",
+                value=config['version_info']['MIRROR_REGISTRY_VERSION']
+            )
+        
+        return config
+    
+    def _execute_environment_setup(self, config: dict) -> None:
+        """執行環境初始化流程"""
+        self.config_manager.save_config(config)
+        st.success("配置已保存！開始執行環境初始化...")
+        
+        if not self._run_env_prep_step():
+            return
+        
+        if not self._run_download_tools_step(config):
+            return
+        
+        self._run_extract_binaries_step(config)
+        st.success("✅ tool_config 配置完成！")
+    
+    def _run_env_prep_step(self) -> bool:
+        """執行環境準備步驟"""
+        with st.expander("Step 1: Environment Preparation", expanded=True):
+            if self.wizard.run_env_prep():
+                st.session_state[SessionKeys.ENV_READY] = True
+                st.success("✅ env_prep 完成")
+                return True
+            else:
+                st.error("❌ env_prep 失敗")
+                st.stop()
+                return False
+    
+    def _run_download_tools_step(self, config: dict) -> bool:
+        """執行工具下載步驟"""
+        with st.expander("Step 2: Download Tools", expanded=True):
+            if not st.session_state.get(SessionKeys.ENV_READY):
+                return False
             
-            with st.expander("Step 1: Environment Preparation", expanded=True):
-                if wizard.run_env_prep():
-                    st.session_state.env_ready = True
-                    st.success("✅ env_prep 完成")
+            progress_bar = st.progress(0)
+            success = self.wizard.run_get_tools(
+                config,
+                progress_callback=lambda p: progress_bar.progress(p)
+            )
+            
+            if success:
+                st.session_state[SessionKeys.TOOLS_DOWNLOADED] = True
+                st.success("✅ get_tools 完成")
+            else:
+                st.error("❌ get_tools 失敗")
+                st.stop()
+            
+            return success
+    
+    def _run_extract_binaries_step(self, config: dict) -> None:
+        """執行二進位檔解壓步驟"""
+        with st.expander("Step 3: Extract binary", expanded=True):
+            if not st.session_state.get(SessionKeys.TOOLS_DOWNLOADED):
+                return
+            
+            if self.wizard.run_untar_oc_mirror(config):
+                st.success("✅ untar_oc_mirror 完成")
+            else:
+                st.error("❌ untar_oc_mirror 失敗")
+            
+            if self.wizard.run_untar_grpcurl(config):
+                st.success("✅ untar_grpcurl 完成")
+            else:
+                st.error("❌ untar_grpcurl 失敗")
+    
+    # === Operator Catalog 區塊 ===
+    
+    def _render_operator_catalog_section(self, config: dict) -> None:
+        """渲染 Operator Catalog 獲取區塊"""
+        if not self._is_grpcurl_available():
+            return
+        
+        with st.expander("Step 4: Operator Registry & Index", expanded=True):
+            self._render_container_status()
+            st.markdown("---")
+            self._render_index_management(config)
+    
+    def _is_grpcurl_available(self) -> bool:
+        """檢查 grpcurl 是否可用"""
+        if not st.session_state.get(SessionKeys.TOOLS_DOWNLOADED, False):
+            return False
+        
+        for path in [
+            os.path.join(os.path.expanduser("~"), ".local/bin/grpcurl"),
+            os.path.join(self.current_dir, "usr/bin/grpcurl")
+        ]:
+            if os.path.exists(path):
+                return True
+        
+        st.warning("⚠️ grpcurl 未找到")
+        return False
+    
+    def _render_container_status(self) -> None:
+        """渲染容器狀態區塊"""
+        st.subheader("🐳 Operator Registry 容器狀態")
+        
+        container_name = self._get_container_name()
+        registry = self.wizard.registry
+        is_running = registry.check_container_running(container_name)
+        exists = registry.check_container_exists(container_name)
+        
+        col_status, col_action = st.columns([2, 1])
+        
+        with col_status:
+            self._render_container_status_info(container_name, is_running, exists, registry)
+        
+        with col_action:
+            self._render_container_action_button(container_name, is_running, registry)
+    
+    def _render_container_status_info(
+        self, 
+        name: str, 
+        is_running: bool, 
+        exists: bool, 
+        registry: RegistryManager
+    ) -> None:
+        """渲染容器狀態資訊"""
+        if is_running:
+            st.success(f"✅ 容器運行中: `{name}`")
+            with st.expander("📋 容器詳細資訊", expanded=False):
+                details = registry.get_container_details(name)
+                if details:
+                    st.code(details, language="text")
+                
+                st.markdown("**最近日誌:**")
+                logs = registry.get_container_logs(name)
+                if logs:
+                    st.code(logs[-1000:], language="text")
                 else:
-                    st.error("❌ env_prep 失敗")
-                    st.stop()
-
-            with st.expander("Step 2: Download Tools", expanded=True):
-                if st.session_state.env_ready:
-                    progress_bar = st.progress(0)
-                    if wizard.run_get_tools(config, progress_callback=lambda p: progress_bar.progress(p)):
-                        st.session_state.tools_downloaded = True
-                        st.success("✅ get_tools 完成")
+                    st.caption("(無日誌輸出)")
+        elif exists:
+            st.warning(f"⚠️ 容器已停止: `{name}`")
+        else:
+            st.info(f"📦 尚未啟動容器: `{name}`")
+    
+    def _render_container_action_button(
+        self, 
+        container_name: str, 
+        is_running: bool, 
+        registry: RegistryManager
+    ) -> None:
+        """渲染容器操作按鈕"""
+        if is_running:
+            if st.button("🛑 停止容器", key="stop_container_btn", type="secondary", use_container_width=True):
+                with st.spinner("正在停止容器..."):
+                    if registry.stop_operator_registry(container_name):
+                        st.success(f"容器 {container_name} 已停止")
                     else:
-                        st.error("❌ get_tools 失敗")
-                        st.stop()
-            
-            with st.expander("Step 3: Extract binary", expanded=True):
-                if st.session_state.tools_downloaded:
-                    if wizard.run_untar_oc_mirror(config):
-                        st.success("✅ untar_oc_mirror 完成")
+                        st.error("停止容器失敗")
+                    time.sleep(1)
+                    st.rerun()
+        else:
+            if st.button("🚀 啟動容器", key="start_container_btn", type="primary", use_container_width=True):
+                with st.spinner("正在啟動容器..."):
+                    config = self.config_manager.get_config()
+                    success, name, port = registry.start_operator_registry(config)
+                    if success:
+                        st.success(f"✅ 容器已啟動: `{name}` (port: {port})")
                     else:
-                        st.error("❌ untar_oc_mirror 失敗")
-                    if wizard.run_untar_grpcurl(config):
-                        st.success("✅ untar_grpcurl 完成")
-                    else:
-                        st.error("❌ untar_grpcurl 失敗")
-            
-            st.success("✅ tool_config 配置完成！")
-
-def _render_fetch_operator_catalog(config, wizard):
-    """渲染 Operator Index 獲取區塊，檢查 grpcurl 後顯示現有索引"""
-    grpcurl_binary = os.path.join(os.path.expanduser("~"), ".local/bin/grpcurl")
-    if not os.path.exists(grpcurl_binary):
-        grpcurl_binary = os.path.join(CURRENT_DIR, "usr/bin/grpcurl")
-
-    if not (st.session_state.get('tools_downloaded', False) and os.path.exists(grpcurl_binary)):
-        if st.session_state.get('tools_downloaded', False):
-            st.warning("⚠️ grpcurl 未找到")
-        return
-
-    with st.expander("Step 4: Fetch Operator Index", expanded=True):
-        index_file = os.path.join(CONFIG_DIR, "operator_index.json")
+                        st.error("❌ 容器啟動失敗")
+                    time.sleep(1)
+                    st.rerun()
+    
+    def _render_index_management(self, config: dict) -> None:
+        """渲染 Operator Index 管理"""
+        index_file = os.path.join(self.config_dir, self.INDEX_FILE)
         
         if os.path.exists(index_file):
-            _render_existing_index(index_file, config, wizard)
+            self._render_existing_index(index_file, config)
         else:
-            _render_fetch_new_index(config, wizard)
-
-def _render_existing_index(index_file, config, wizard):
-    """顯示已存在的 Operator Index 及其資訊，提供刷新按鈕"""
-    try:
-        with open(index_file, 'r') as f:
-            index_data = json.load(f)
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            st.success(f"✅ Operator Index 就緒 ({len(index_data)} packages)")
-        with col2:
-            mtime = os.path.getmtime(index_file)
-            st.caption(f"🕐 {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}")
-        with col3:
-            if st.button("🔄 刷新", key="refresh_grpc_btn", use_container_width=True):
-                _run_fetch_with_progress(config, wizard, "🔄 正在刷新 Operator Index...")
-    except Exception as e:
-        st.error(f"讀取快取失敗: {e}")
-
-def _render_fetch_new_index(config, wizard):
-    """渲染首次獲取 Operator Index 的說明與觸發按鈕"""
-    st.info("📡 尚未獲取 Operator Index")
-    st.markdown("""
-    ### 🔄 獲取流程：
-    1. 📦 啟動 Local Registry 容器
-    2. 📡 透過 gRPC 查詢
-    3. 💾 儲存為 operator_index.json
-    4. 🧹 自動清除容器
-    ⏱️ 首次獲取約需 **2-5 分鐘**
-    """)
+            self._render_fetch_new_index(config)
     
-    if st.button("🚀 開始獲取 Operator Index (gRPC)", type="primary", use_container_width=True):
-        _run_fetch_with_progress(config, wizard, "📡 正在獲取 Operator Index...")
-
-def _run_fetch_with_progress(config, wizard, title):
-    """執行 Operator Index 獲取並顯示進度條與即時日誌"""
-    with st.status(title, expanded=True) as status_container:
-        progress_bar = st.progress(0, "準備開始...")
-        status_text = st.empty()
-        log_container = st.container()
+    def _render_existing_index(self, index_file: str, config: dict) -> None:
+        """渲染已存在的索引"""
+        try:
+            with open(index_file, 'r') as f:
+                index_data = json.load(f)
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.success(f"✅ Operator Index 就緒 ({len(index_data)} packages)")
+            with col2:
+                mtime = os.path.getmtime(index_file)
+                st.caption(f"🕐 {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+            with col3:
+                if st.button("🔄 刷新", key="refresh_grpc_btn", use_container_width=True):
+                    self._run_fetch_with_progress(config, "🔄 正在刷新 Operator Index...")
+        except Exception as e:
+            st.error(f"讀取快取失敗: {e}")
+    
+    def _render_fetch_new_index(self, config: dict) -> None:
+        """渲染首次獲取索引"""
+        st.info("📡 尚未獲取 Operator Index")
+        st.markdown("""
+        ### 🔄 獲取流程：
+        1. 📦 確認 Local Registry 容器已啟動
+        2. 📡 透過 gRPC 查詢 Operator 目錄
+        3. 💾 儲存為 operator_index.json
         
-        def update_status(msg):
-            with log_container:
-                st.write(f"➤ {msg}")
-            _update_progress(msg, progress_bar, status_text)
+        ⚠️ **注意：獲取完成後容器不會自動關閉，請手動關閉。**
+        """)
         
-        if wizard.run_get_operator_catalog_via_grpc(config, status_callback=update_status):
-            progress_bar.progress(100, "完成!")
-            status_text.success("🎉 Operator Index 獲取完成!")
-            status_container.update(label="✅ 完成!", state="complete", expanded=False)
-            st.balloons()
-            time.sleep(1)
-            st.rerun()
-        else:
-            progress_bar.empty()
-            status_text.empty()
-            status_container.update(label="❌ 失敗", state="error", expanded=True)
-            st.error("❌ Operator Index 獲取失敗")
+        if st.button("🚀 開始獲取 Operator Index (gRPC)", type="primary", use_container_width=True):
+            self._run_fetch_with_progress(config, "📡 正在獲取 Operator Index...")
+    
+    def _run_fetch_with_progress(self, config: dict, title: str) -> None:
+        """執行查詢並顯示進度"""
+        with st.status(title, expanded=True) as status_container:
+            progress_bar = st.progress(0, "準備開始...")
+            status_text = st.empty()
+            log_container = st.container()
+            all_logs = []
+            
+            def update_status(msg: str) -> None:
+                all_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+                with log_container:
+                    st.write(f"➤ {msg}")
+                self._update_progress(msg, progress_bar, status_text)
+            
+            success = self.wizard.run_get_operator_catalog_via_grpc(
+                config, status_callback=update_status
+            )
+            
+            if success:
+                self._handle_fetch_success(status_container, progress_bar, status_text, all_logs)
+            else:
+                self._handle_fetch_failure(status_container, progress_bar, status_text, all_logs)
+    
+    def _handle_fetch_success(
+        self, 
+        container: Any, 
+        progress_bar: Any, 
+        status_text: Any, 
+        logs: list
+    ) -> None:
+        """處理查詢成功"""
+        progress_bar.progress(100, "完成!")
+        status_text.success("🎉 Operator Index 獲取完成!")
+        container.update(label="✅ 完成!", state="complete", expanded=False)
+        st.balloons()
+        
+        with st.expander("📋 執行日誌", expanded=False):
+            st.code("\n".join(logs), language="text")
+        
+        time.sleep(2)
+        st.rerun()
+    
+    def _handle_fetch_failure(
+        self, 
+        container: Any, 
+        progress_bar: Any, 
+        status_text: Any, 
+        logs: list
+    ) -> None:
+        """處理查詢失敗"""
+        progress_bar.empty()
+        status_text.empty()
+        container.update(label="❌ 失敗", state="error", expanded=True)
+        st.error("❌ Operator Index 獲取失敗")
+        
+        with st.expander("📋 完整執行日誌 (用於除錯)", expanded=True):
+            st.code("\n".join(logs), language="text")
+        
+        st.warning("""
+        ### 💡 除錯建議：
+        1. 確認容器是否正常運行
+        2. 檢查 gRPC 埠：`grpcurl -plaintext 127.0.0.1:50051 list`
+        3. 檢查容器日誌：`podman logs operator-registry-4.20`
+        4. 確認 SELinux：`getenforce`（應為 Permissive）
+        """)
+    
+    def _update_progress(self, msg: str, progress_bar: Any, status_text: Any) -> None:
+        """更新進度條"""
+        progress_rules = [
+            ("初始化", 5, "初始化任務..."),
+            ("grpcurl" in msg and "找到" in msg, 10, "工具就緒"),
+            ("檢查鏡像", 15, "檢查鏡像..."),
+            ("鏡像已存在" in msg or "鏡像就緒" in msg, 20, "鏡像就緒"),
+            ("鏡像不存在" in msg or "開始拉取" in msg, 20, "拉取鏡像..."),
+            ("鏡像拉取完成", 35, "鏡像拉取完成"),
+            ("啟動" in msg and "容器" in msg, 40, "啟動容器..."),
+            ("容器已啟動" in msg or "容器已在運行" in msg, 45, "容器已啟動"),
+            ("查詢" in msg and "Packages" in msg, 60, "查詢 Packages..."),
+            ("找到" in msg and "packages" in msg, 70, "獲取詳細資訊..."),
+            ("operator_index.json" in msg or "已創建" in msg, 95, "儲存中..."),
+            ("完成" in msg, 100, "完成!"),
+        ]
+        
+        for rule in progress_rules:
+            if isinstance(rule[0], bool):
+                condition = rule[0]
+            else:
+                condition = rule[0] in msg
+            
+            if condition:
+                progress_bar.progress(rule[1], rule[2])
+                if "拉取鏡像" in msg:
+                    status_text.info("📥 鏡像不存在，正在拉取... (可能需要 3-10 分鐘)")
+                break
+        
+        # 特殊處理：百分比進度
+        if "處理中" in msg:
+            match = re.search(r'(\d+)/(\d+)', msg)
+            if match:
+                current, total = int(match.group(1)), int(match.group(2))
+                pct = 70 + int((current / total) * 20)
+                progress_bar.progress(pct, f"處理中... ({current}/{total})")
+    
+    def _render_next_button(self) -> None:
+        """渲染下一步按鈕"""
+        if st.session_state.get(SessionKeys.TOOLS_DOWNLOADED, False):
+            st.divider()
+            if st.button("➡️ Next: Cluster Config", use_container_width=True):
+                st.session_state[SessionKeys.CURRENT_VIEW] = 'cluster_config'
+                st.rerun()
+    
+    def _get_container_name(self) -> str:
+        """取得容器名稱"""
+        config = self.config_manager.get_config()
+        v_info = config.get('version_info', {})
+        ocp_release = v_info.get('OCP_RELEASE', RegistryManager.DEFAULT_OCP_RELEASE)
+        match = re.match(r'(\d+\.\d+)', ocp_release)
+        ocp_version = match.group(1) if match else RegistryManager.DEFAULT_OCP_VERSION
+        return RegistryManager.CONTAINER_NAME_TEMPLATE.format(version=ocp_version)
 
-def _update_progress(msg, progress_bar, status_text):
-    """根據後端回傳的狀態訊息更新前端的進度條與狀態文字"""
-    if "初始化" in msg:
-        progress_bar.progress(5, "初始化任務...")
-    elif "grpcurl" in msg and "找到" in msg:
-        progress_bar.progress(10, "工具就緒")
-    elif "檢查鏡像" in msg:
-        progress_bar.progress(15, "檢查鏡像...")
-    elif "鏡像已存在" in msg:
-        progress_bar.progress(20, "鏡像就緒")
-    elif "鏡像不存在" in msg or "開始拉取" in msg:
-        progress_bar.progress(20, "拉取鏡像...")
-        status_text.info("📥 鏡像不存在，正在拉取... (可能需要 3-10 分鐘)")
-    elif "鏡像拉取完成" in msg:
-        progress_bar.progress(35, "鏡像拉取完成")
-    elif "啟動" in msg and "容器" in msg:
-        progress_bar.progress(40, "啟動容器...")
-    elif "容器已啟動" in msg:
-        progress_bar.progress(45, "容器已啟動")
-    elif "查詢" in msg and "Packages" in msg:
-        progress_bar.progress(60, "查詢 Packages...")
-    elif "找到" in msg and "packages" in msg:
-        progress_bar.progress(70, "獲取詳細資訊...")
-    elif "處理中" in msg:
-        import re
-        match = re.search(r'(\d+)/(\d+)', msg)
-        if match:
-            current, total = int(match.group(1)), int(match.group(2))
-            pct = 70 + int((current / total) * 20)
-            progress_bar.progress(pct, f"處理中... ({current}/{total})")
-    elif "operator_index.json" in msg or "已創建" in msg:
-        progress_bar.progress(95, "儲存中...")
-    elif "容器已清除" in msg:
-        progress_bar.progress(100, "完成!")
-    elif "完成" in msg:
-        progress_bar.progress(100, "完成!")
+
+# === 模組級函數（向後相容） ===
+
+def show_tool_config_page():
+    """渲染工具配置頁面（向後相容的入口函數）"""
+    ui = ToolConfigUI()
+    ui.render()
+
 
 def render_next_button():
-    """當 tools_downloaded 為 True 時渲染前往 Cluster Config 的按鈕"""
-    if st.session_state.get('tools_downloaded', False):
+    """渲染下一步按鈕（向後相容）"""
+    if st.session_state.get(SessionKeys.TOOLS_DOWNLOADED, False):
         st.divider()
         if st.button("➡️ Next: Cluster Config", use_container_width=True):
-            st.session_state.current_view = 'cluster_config'
+            st.session_state[SessionKeys.CURRENT_VIEW] = 'cluster_config'
             st.rerun()

@@ -1,0 +1,194 @@
+import os
+from typing import Dict, Tuple, List
+from .base_manager import BaseManager
+
+
+class InstallManager(BaseManager):
+    """安裝管理類別（CLI 工具、基礎套件）"""
+    
+    # 基礎套件列表
+    BASE_PACKAGES = ['net-tools', 'git', 'httpd']
+    
+    def install_packages(self, packages: List[str] = None) -> Tuple[bool, str]:
+        """安裝基礎套件 - 對應 packages.yml"""
+        if packages is None:
+            packages = self.BASE_PACKAGES
+        
+        self._log(f"開始安裝基礎套件: {', '.join(packages)}...")
+        
+        failed_packages = []
+        installed_packages = []
+        
+        for package in packages:
+            self._log(f"安裝 {package}...")
+            success, _, err = self._run_command(f"yum install -y {package}")
+            if success:
+                installed_packages.append(package)
+            else:
+                failed_packages.append(package)
+                self._log(f"{package} 安裝失敗: {err}", "ERROR")
+        
+        # 設定 httpd 監聽埠（如果安裝了 httpd）
+        if 'httpd' in installed_packages:
+            self._configure_httpd()
+        
+        if failed_packages:
+            return False, f"部分套件安裝失敗: {', '.join(failed_packages)}"
+        
+        return True, f"基礎套件安裝完成: {', '.join(installed_packages)}"
+    
+    def _configure_httpd(self) -> None:
+        """設定 httpd 監聽埠為 8080"""
+        self._log("設定 httpd 監聽埠為 8080...")
+        httpd_conf = '/etc/httpd/conf/httpd.conf'
+        
+        self._backup_file(httpd_conf)
+        self._run_command(
+            "sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf"
+        )
+        self._run_command("systemctl restart httpd")
+        self._run_command("systemctl enable httpd")
+    
+    def install_openshift_install_cli(self) -> Tuple[bool, str]:
+        """安裝 openshift-install CLI"""
+        self._log("安裝 openshift-install CLI...")
+        
+        ocp_install_dir = self.config.get('ocpInstallDir', '/root/openshift-install-linux.tar.gz')
+        target_path = '/usr/bin/openshift-install'
+        
+        # 檢查是否已安裝
+        if os.path.exists(target_path):
+            success, stdout, _ = self._run_command(f"{target_path} version")
+            version = stdout.strip() if success else "unknown"
+            return True, f"openshift-install 已安裝 (版本: {version})"
+        
+        # 檢查安裝包
+        if not os.path.exists(ocp_install_dir):
+            return False, f"找不到 openshift-install 安裝包: {ocp_install_dir}"
+        
+        # 解壓安裝
+        success, stdout, err = self._run_command(f"tar -xzf {ocp_install_dir} -C /usr/bin/")
+        if not success:
+            return False, f"解壓 openshift-install 失敗: {err}"
+        
+        # 檢查解壓後是否有 openshift-install，如果名稱不同則重新命名
+        if not os.path.exists(target_path):
+            # 列出解壓的檔案
+            success, stdout, _ = self._run_command(f"tar -tzf {ocp_install_dir}")
+            if success:
+                files = stdout.strip().split('\n')
+                for f in files:
+                    f = f.strip()
+                    if f and not f.endswith('/'):
+                        extracted_file = f"/usr/bin/{f}"
+                        if os.path.exists(extracted_file) and f != 'openshift-install':
+                            self._run_command(f"mv {extracted_file} {target_path}")
+                            break
+        
+        # 設定權限
+        self._run_command(f"chmod +x {target_path}")
+        
+        if os.path.exists(target_path):
+            return True, "openshift-install 安裝成功"
+        else:
+            return False, "openshift-install 安裝後無法找到執行檔"
+    
+    def install_oc_client(self) -> Tuple[bool, str]:
+        """安裝 oc 客戶端 CLI"""
+        self._log("安裝 oc 客戶端 CLI...")
+        
+        ocp_client_dir = self.config.get('ocpClientDir', '/root/openshift-client-linux.tar.gz')
+        target_path = '/usr/bin/oc'
+        
+        # 檢查是否已安裝
+        if os.path.exists(target_path):
+            success, stdout, _ = self._run_command(f"{target_path} version --client")
+            version = stdout.strip().split('\n')[0] if success else "unknown"
+            return True, f"oc client 已安裝 (版本: {version})"
+        
+        # 檢查安裝包
+        if not os.path.exists(ocp_client_dir):
+            return False, f"找不到 oc client 安裝包: {ocp_client_dir}"
+        
+        # 解壓安裝（oc client 通常包含 oc 和 kubectl）
+        success, stdout, err = self._run_command(f"tar -xzf {ocp_client_dir} -C /usr/bin/")
+        if not success:
+            return False, f"解壓 oc client 失敗: {err}"
+        
+        # 設定權限
+        if os.path.exists(target_path):
+            self._run_command(f"chmod +x {target_path}")
+        else:
+            return False, "oc client 安裝後無法找到執行檔"
+        
+        # 設定 bash completion
+        self._setup_bash_completion()
+        
+        return True, "oc client 安裝成功"
+    
+    def _setup_bash_completion(self) -> None:
+        """設定 oc 命令的 bash completion"""
+        target_path = '/usr/bin/oc'
+        completion_dir = '/etc/bash_completion.d'
+        
+        if os.path.exists(target_path):
+            os.makedirs(completion_dir, exist_ok=True)
+            self._run_command(
+                f"{target_path} completion bash > {completion_dir}/oc_bash_completion"
+            )
+            self._log("已設定 oc bash completion")
+    
+    def install_all_cli(self) -> Tuple[bool, str]:
+        """安裝所有 CLI 工具"""
+        self._log("開始安裝所有 CLI 工具...")
+        
+        results = []
+        
+        # 安裝 openshift-install
+        success, msg = self.install_openshift_install_cli()
+        results.append(("openshift-install", success, msg))
+        
+        # 安裝 oc client
+        success, msg = self.install_oc_client()
+        results.append(("oc client", success, msg))
+        
+        # 彙總結果
+        failed = [(name, msg) for name, success, msg in results if not success]
+        success_list = [(name, msg) for name, success, msg in results if success]
+        
+        if failed:
+            fail_msgs = [f"{name}: {msg}" for name, msg in failed]
+            return False, f"部分 CLI 安裝失敗: {'; '.join(fail_msgs)}"
+        
+        success_msgs = [f"{name}: {msg}" for name, msg in success_list]
+        return True, f"所有 CLI 工具安裝完成\n" + "\n".join(success_msgs)
+    
+    def verify_installations(self) -> Tuple[bool, str]:
+        """驗證所有安裝"""
+        self._log("驗證安裝...")
+        
+        checks = []
+        all_ok = True
+        
+        # 檢查 openshift-install
+        if os.path.exists('/usr/bin/openshift-install'):
+            _, version, _ = self._run_command('/usr/bin/openshift-install version')
+            checks.append(f"✅ openshift-install: {version.strip()}")
+        else:
+            checks.append("⚠️ openshift-install 未安裝")
+        
+        # 檢查 oc
+        if os.path.exists('/usr/bin/oc'):
+            _, version, _ = self._run_command('/usr/bin/oc version --client')
+            checks.append(f"✅ oc client: {version.strip().split(chr(10))[0]}")
+        else:
+            checks.append("⚠️ oc client 未安裝")
+        
+        # 檢查 podman
+        if os.path.exists('/usr/bin/podman'):
+            _, version, _ = self._run_command('podman --version')
+            checks.append(f"✅ podman: {version.strip()}")
+        else:
+            checks.append("⚠️ podman 未安裝")
+        
+        return all_ok, "\n".join(checks)

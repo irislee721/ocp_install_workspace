@@ -17,8 +17,16 @@ uv venv --python 3.12
 
 ### How to start
 1. install streamlit package
-
+```
+uv pip install streamlit
+```
+```
+uv pip install yamlgen
+```
 2. execute python
+```
+cd install_tool
+```
 ```bash
 streamlit run prep_app.py
 ```
